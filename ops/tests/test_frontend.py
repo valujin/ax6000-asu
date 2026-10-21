@@ -43,17 +43,22 @@ class FrontendContractTests(unittest.TestCase):
         self.assertTrue(model['networks']['api']['internal'])
         self.assertTrue(model['networks']['npm']['external'])
         self.assertEqual(model['networks']['npm']['name'], 'nginx-proxy-manager_default')
-        self.assertEqual(set(model['services']['frontend']['networks']), {'api', 'npm'})
+        self.assertNotIn('frontend', model['services'])
+        gateway = model['services']['ax6000-asu-front']
+        self.assertEqual(set(gateway['networks']), {'api', 'npm'})
+        self.assertEqual(gateway['networks']['npm']['aliases'], ['ax6000-asu-front'])
+        self.assertEqual([name for name, service in model['services'].items()
+                          if 'npm' in service['networks']], ['ax6000-asu-front'])
         self.assertEqual(set(model['services']['immutable_mirror']['networks']), {'api', 'mirror_egress'})
-        self.assertEqual(int(model['services']['frontend']['mem_limit']), 64 * 1024**2)
-        self.assertEqual(float(model['services']['frontend']['cpus']), 0.1)
-        self.assertNotIn('ports', model['services']['frontend'])
+        self.assertEqual(int(gateway['mem_limit']), 64 * 1024**2)
+        self.assertEqual(float(gateway['cpus']), 0.1)
+        self.assertNotIn('ports', gateway)
         for service in ('api66', 'api612recommended', 'api612latest', 'redis', 'immutable_mirror'):
             self.assertNotIn('npm', model['services'][service]['networks'])
 
     def test_gateway_has_no_socket_host_port_or_eager_upstream_dependency(self):
         compose = (ROOT / 'deploy/frontend.yml').read_text()
-        frontend = compose.split('  frontend:\n', 1)[1].split('\n  immutable_mirror:', 1)[0]
+        frontend = compose.split('  ax6000-asu-front:\n', 1)[1].split('\n  immutable_mirror:', 1)[0]
         self.assertIn(IMAGE, frontend)
         self.assertIn('aliases: [ax6000-asu-front]', frontend)
         self.assertIn('name: nginx-proxy-manager_default', compose)

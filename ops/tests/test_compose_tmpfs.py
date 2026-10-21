@@ -12,7 +12,7 @@ IMAGE = 'sha256:2398ea9311ca86441bd2c5756646caf2b5831f5d2c2a63c2d86373d5c527e653
 EXPECTED = {
     'api66': '/tmp:size=32m,mode=1777',
     'worker': '/tmp:size=64m,mode=1777',
-    'frontend': '/tmp:size=16m,mode=1777,uid=101,gid=101',
+    'ax6000-asu-front': '/tmp:size=16m,mode=1777,uid=101,gid=101',
     'immutable_mirror': '/tmp:size=128m,mode=1777',
 }
 

@@ -75,6 +75,10 @@ APIs and the worker join both the internal `api` network and the dedicated
 noninternal `egress` bridge. The latter permits HTTPS index access and Docker
 host-port publishing. Redis stays only on `api`; the frontend keeps its existing
 `api` and NPM networks. API host ports remain bound to loopback.
+
+The gateway service key is `ax6000-asu-front`, matching its explicit NPM alias.
+Compose automatically registers service keys on shared networks, so using the
+generic key `frontend` would collide with unrelated projects on that network.
 The applied setup scripts, current host identity, mapped container-UID read ACL,
 and actual PID1 hard-kill lock proof are documented in [ops/host](../ops/host/README.md).
 

@@ -1,7 +1,9 @@
 # Merge with compose.yml using the SAME project name. Never edit NPM's compose,
 # containers or vhosts. Start only explicitly promoted cohorts/services.
 services:
-  frontend:
+  # Compose also registers its service key as DNS alias on the shared NPM network.
+  # Keep this key unique so another project's generic "frontend" is untouched.
+  ax6000-asu-front:
     image: nginx@sha256:970364228b1e4f932abc22d321932816782cca8a20b85a77552a7cfe9acfb3b5
     user: "101:101"
     read_only: true
