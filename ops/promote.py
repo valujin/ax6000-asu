@@ -582,8 +582,22 @@ def merge_supplement(identity,controls,protected,native_hashes,packages):
     return changed
 
 
+def native_acceptance_options(args):
+    path=getattr(args,'native_acceptance',None);pin=getattr(args,'native_acceptance_sha256',None)
+    if path is None and pin is None:return False
+    require(path is not None and isinstance(pin,str) and SHA.fullmatch(pin),
+            '--native-acceptance and its explicit SHA256 must be supplied together')
+    require(args.cohort=='612-recommended' and bool(getattr(args,'source',None))
+            and getattr(args,'hosted_context',None) is None,
+            'Native acceptance is available only with the actual recommended native source')
+    return True
+
+
 def promote(args):
     require(args.cohort in {'66','612-recommended','612-latest'},'Unsupported cohort')
+    use_native_acceptance=native_acceptance_options(args)
+    require(bool(getattr(args,'source',None)) != bool(getattr(args,'hosted_context',None)),
+            'Choose exactly one actual native source or explicit hosted context')
     site=args.site_url.rstrip('/');url=urlsplit(site)
     require(url.scheme=='https' and url.hostname and not url.username and not url.password and not url.query and not url.fragment,
             'Immutable service base must be an unambiguous HTTPS URL')
@@ -605,9 +619,24 @@ def promote(args):
                 'Native RAW profile bytes differ from signed snapshot')
         importer=load_module(recipe/'scripts/import-release.py','promote_import')
         importer.validate_metadata(Path(args.raw),source_profile)
-        source=Path(args.source).absolute()
-        require(subprocess.check_output(['git','-C',str(source),'rev-parse','HEAD'],text=True).strip()==profile['firmware']['commit'],
-                'Actual native source commit differs')
+        hosted=None
+        if getattr(args,'hosted_context',None) is not None:
+            hosted_module=load_module(ROOT/'ops/hosted_context.py','promote_hosted_context')
+            hosted=hosted_module.load(args.hosted_context,args.hosted_context_sha256,cohort=args.cohort,
+                profile=profile,native=native,raw=args.raw,recipe=recipe)
+            source=None
+            hosted.validate_smoke_scope(smoke)
+        else:
+            source=Path(args.source).absolute()
+            require(subprocess.check_output(['git','-C',str(source),'rev-parse','HEAD'],text=True).strip()==profile['firmware']['commit'],
+                    'Actual native source commit differs')
+        accepted_native=None
+        if use_native_acceptance:
+            acceptance=load_module(ROOT/'ops/native_acceptance.py','promote_native_acceptance')
+            accepted_native=acceptance.verify(args.native_acceptance,args.native_acceptance_sha256,
+                cohort=args.cohort,profile=profile,native=native,native_evidence=args.native_evidence,
+                native_evidence_sha256=args.native_evidence_sha256,raw=args.raw,source=source,
+                recipe_commit=args.recipe_commit)
         require(profile.get('asu',{}).get('enabled') is True and profile['asu'].get('cohort')==args.cohort,
                 'Generation does not enable this ASU cohort')
         builder=load_module(ROOT/'ops/builder_image.py','promote_builder')
@@ -640,7 +669,11 @@ def promote(args):
             attestation=read_json(tree/'ax6000-imagebuilder.json')
             require(sha256(tree/'ax6000-imagebuilder.json')==approval['attestation_sha256'],'Verified IB attestation differs from approved image')
             builder.scan_tree(tree,approval)
-            overlay=rootfs_overlay(recipe,source,profile,native,attestation)
+            if hosted is not None:
+                hosted.verify_tree(tree,attestation)
+                overlay=hosted.overlay
+            else:
+                overlay=rootfs_overlay(recipe,source,profile,native,attestation)
             identity,controls=identities(attestation['packages'])
             installed,version=native_layouts(native,args.raw,profile,identity,args.cohort)
             version_number,version_code=version
@@ -692,6 +725,10 @@ def promote(args):
                           'kernel_version':profile['firmware']['kernel_version'],'files':files,
                           'recipe_commit':args.recipe_commit,'native_bank_archive_sha256':sha256(archive),
                           'imagebuilder_verified':verified,'package_count':len(identity)}
+            if hosted is not None:
+                feed_receipt['hosted_context']=hosted.scope
+            if accepted_native is not None:
+                feed_receipt['native_acceptance']=accepted_native
             feed_bytes=canonical(feed_receipt)
             data={'schema_version':1,'cohort':args.cohort,'build_id':profile['build_id'],'source_commit':profile['firmware']['commit'],
                   'seed':profile['asu']['seed'],'snapshot_sha256':snapshot_sha,'package_manager':'opkg' if args.cohort=='66' else 'apk',
@@ -706,8 +743,11 @@ def promote(args):
                   'rootfs_overlay':overlay,
                   'repositories_conf':(('src/gz ax6000 '+repositories[0]+'\noption check_signature\n') if args.cohort=='66' else '\n'.join(repositories)+'\n'),
                   'repository_keys':list(dict.fromkeys(keytexts))}
+            if accepted_native is not None:
+                data['promotion']['native_acceptance_sha256']=accepted_native['native_acceptance_sha256']
             if args.cohort!='66':
-                data['apk_protected_roots']=apk_protected_roots(source,attestation)
+                data['apk_protected_roots']=(hosted.policy['protected_roots'] if hosted is not None
+                                             else apk_protected_roots(source,attestation))
                 require(set(origins)==set(identity),'APK catalog origins do not cover every approved identity')
                 data.update(apk_repositories=indexes,package_origins=origins)
                 if args.public_candidates or args.public_package:
@@ -729,6 +769,10 @@ def promote(args):
                 audit={'schema_version':1,'catalog_sha256':catalog_sha,'snapshot_sha256':snapshot_sha,'immutable_path':str(immutable),
                        'recipe_commit':args.recipe_commit,'builder_load_receipt_sha256':args.builder_load_receipt_sha256,
                        'builder_image_approval_sha256':args.builder_image_approval_sha256,'service_activated':False}
+                if hosted is not None:
+                    audit['hosted_context']=hosted.scope
+                if accepted_native is not None:
+                    audit['native_acceptance']=accepted_native
                 write_new(ready/'promotion.json',canonical(audit));ready.chmod(0o555);rename_new(ready,output)
     return {'catalog':str(output/'catalog.json'),'catalog_sha256':catalog_sha,'snapshot_sha256':snapshot_sha,'service_activated':False}
 
@@ -736,13 +780,19 @@ def promote(args):
 def main(argv=None):
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--cohort',required=True,choices=('66','612-recommended','612-latest'))
-    for name in ('package-repository','source-profile','snapshot','raw','source','imagebuilder-archive','native-evidence','imagebuilder-evidence',
+    for name in ('package-repository','source-profile','snapshot','raw','imagebuilder-archive','native-evidence','imagebuilder-evidence',
                  'builder-image-approval','builder-load-receipt','builder-image-archive','public-key','usign','store','output'):
         parser.add_argument('--'+name,type=Path,required=True)
     for name in ('recipe-commit','native-evidence-sha256','imagebuilder-evidence-sha256','builder-image-approval-sha256',
                  'builder-load-receipt-sha256','usign-sha256','site-url'):
         parser.add_argument('--'+name,required=True)
     parser.add_argument('--apk',type=Path);parser.add_argument('--apk-sha256');parser.add_argument('--apk-public-key',type=Path)
+    context=parser.add_mutually_exclusive_group(required=True)
+    context.add_argument('--source',type=Path)
+    context.add_argument('--hosted-context',type=Path)
+    parser.add_argument('--hosted-context-sha256')
+    parser.add_argument('--native-acceptance',type=Path)
+    parser.add_argument('--native-acceptance-sha256')
     parser.add_argument('--mirror-registry',type=Path);parser.add_argument('--mirror-registry-sha256')
     parser.add_argument('--mirror-root',type=Path);parser.add_argument('--mirror-prefix',default='/indexes')
     public=parser.add_mutually_exclusive_group()

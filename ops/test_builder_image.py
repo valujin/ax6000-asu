@@ -5,6 +5,7 @@ import importlib.util
 import io
 import json
 import os
+import re
 from pathlib import Path
 import tarfile
 import tempfile
@@ -152,16 +153,134 @@ class BuilderImageTests(unittest.TestCase):
 
     def test_vendor_exception_inventory_rejects_unknown_or_incomplete_approvals(self):
         entry = copy.deepcopy(image.PUBLIC_VENDOR_TOOL)
-        self.assertEqual(image.reviewed_vendor_tools({'reviewed_public_vendor_tools': [entry]}), {entry['path']: entry})
+        self.assertEqual(image.reviewed_vendor_tools(self.proof | {'reviewed_public_vendor_tools': [entry]}),
+                         {entry['path']: entry})
         invalid = [None, {}, [entry, entry], [entry | {'path': 'staging_dir/host/bin/other-tool'}],
                    [entry | {'sha256': '0' * 64}], [entry | {'size': entry['size'] + 1}],
                    [entry | {'classification': 'signing-credential'}], [entry | {'source_commit': '0' * 40}],
                    [entry | {'source_header_sha256': '0' * 64}], [entry | {'source_implementation_sha256': '0' * 64}],
                    [{key: value for key, value in entry.items() if key != 'source_repository'}],
-                   [entry | {'allow_all_keys': True}]]
+                   [entry | {'public_key_blocks': 6}], [entry | {'allow_all_keys': True}]]
         for value in invalid:
             with self.subTest(value=value), self.assertRaises(ValueError):
-                image.reviewed_vendor_tools({'reviewed_public_vendor_tools': value})
+                image.reviewed_vendor_tools(self.proof | {'reviewed_public_vendor_tools': value})
+
+    def test_vendor_record_requires_its_exact_cohort_and_rejects_unmeasured_612(self):
+        entry = copy.deepcopy(image.PUBLIC_VENDOR_TOOL)
+        for cohort in (None, '612-recommended', '612-latest', 'unknown'):
+            with self.subTest(cohort=cohort), self.assertRaisesRegex(ValueError, 'cohort'):
+                image.reviewed_vendor_tools({'cohort': cohort, 'reviewed_public_vendor_tools': [entry]})
+        self.assertEqual(image.reviewed_vendor_tools({'cohort': '612-latest'}), {})
+        # Known research identities are not approvals of a new portable IB.
+        for cohort, size, sha256 in (
+                ('612-recommended', 1708336,
+                 'eb4947b1a2cfe6c8862295f6decf7699aa1ef0aadcb59126f1c01ca92894ac08'),
+                ('612-latest', 1493272,
+                 'cd61cb05012bfddd79a88a3ddf0b072d201d43b9676c187d409dbd423157be57')):
+            candidate = entry | {'size': size, 'sha256': sha256,
+                'source_commit': '6a87eaf434cb89d4eba0b811a4b5d158fd9c519f',
+                'source_header_sha256': '1455ab4366e869ea7afe3fecbe8b20baa5c9a2c105dc18c6e3dc9bfc55483e87',
+                'source_implementation_sha256': 'b9ee120c68b3d1ea2f479ee15f646a0aa3343aa36a92db7a4d647cf91bad43b3',
+                'public_key_blocks': 6}
+            with self.subTest(unapproved_research_cohort=cohort), self.assertRaises(ValueError):
+                image.reviewed_vendor_tools({'cohort': cohort, 'reviewed_public_vendor_tools': [candidate]})
+
+    def test_future_612_record_is_only_a_synthetic_fixture_and_uses_its_own_size(self):
+        # This is deliberately not a real vendor executable or a production
+        # record. The larger fixture catches accidental use of the 6.6 bound.
+        blob = bytearray(b'\x7fELF\x02\x01\x01' + b'\0' * (image.PUBLIC_VENDOR_TOOL['size'] + 1))
+        blob[18:20] = b'\x3e\x00'
+        blob = bytes(blob)
+        entry = image.PUBLIC_VENDOR_TOOL | {'sha256': digest(blob), 'size': len(blob),
+            'source_commit': '6a87eaf434cb89d4eba0b811a4b5d158fd9c519f',
+            'source_header_sha256': '1455ab4366e869ea7afe3fecbe8b20baa5c9a2c105dc18c6e3dc9bfc55483e87',
+            'source_implementation_sha256': 'b9ee120c68b3d1ea2f479ee15f646a0aa3343aa36a92db7a4d647cf91bad43b3',
+            'public_key_blocks': 6}
+        path = self.root / 'synthetic-future-vendor-tool.bin'
+        path.write_bytes(blob)
+        proof = {'cohort': '612-recommended', 'reviewed_public_vendor_tools': [entry]}
+        with self.assertRaises(ValueError):
+            image.reviewed_vendor_tools(proof)
+        with self.assertRaises(ValueError):
+            image.verify_reviewed_vendor_tool(path, entry)
+        fixture_records = (*image.REVIEWED_PUBLIC_VENDOR_TOOLS, ('612-recommended', entry))
+        with patch.object(image, 'REVIEWED_PUBLIC_VENDOR_TOOLS', fixture_records):
+            self.assertEqual(image.reviewed_vendor_tools(proof), {entry['path']: entry})
+            image.verify_reviewed_vendor_tool(path, entry)
+            for cohort in ('66', '612-latest', None):
+                with self.subTest(cohort=cohort), self.assertRaises(ValueError):
+                    image.reviewed_vendor_tools(proof | {'cohort': cohort})
+            for field, value in [('size', len(blob) - 1), ('sha256', '0' * 64),
+                                 ('source_commit', '0' * 40), ('source_header_sha256', '0' * 64),
+                                 ('public_key_blocks', 5), ('path', 'staging_dir/host/bin/dlink-sge-image')]:
+                with self.subTest(field=field), self.assertRaises(ValueError):
+                    image.reviewed_vendor_tools(proof | {'reviewed_public_vendor_tools': [entry | {field: value}]})
+            for bad_blob in (blob + b'!', blob[:-1], blob[:-1] + b'!', b'!' + blob[1:]):
+                path.write_bytes(bad_blob)
+                with self.assertRaises(ValueError):
+                    image.verify_reviewed_vendor_tool(path, entry)
+
+    def test_recommended_portable_record_is_literal_and_latest_remains_unapproved(self):
+        entry = copy.deepcopy(image.RECOMMENDED_PUBLIC_VENDOR_TOOL)
+        proof = {'cohort': '612-recommended', 'reviewed_public_vendor_tools': [entry]}
+        self.assertEqual(image.reviewed_vendor_tools(proof), {entry['path']: entry})
+        for cohort in ('66', '612-latest', None):
+            with self.subTest(cohort=cohort), self.assertRaises(ValueError):
+                image.reviewed_vendor_tools(proof | {'cohort': cohort})
+        for field, value in [('size', entry['size'] + 1), ('sha256', '0' * 64),
+                             ('public_key_blocks', 5), ('public_key_blocks', 7),
+                             ('source_commit', '0' * 40), ('source_header_sha256', '0' * 64),
+                             ('source_implementation_sha256', '0' * 64),
+                             ('path', 'staging_dir/host/bin/dlink-sge-image')]:
+            with self.subTest(field=field, value=value), self.assertRaises(ValueError):
+                image.reviewed_vendor_tools(proof | {'reviewed_public_vendor_tools': [entry | {field: value}]})
+        self.assertEqual(image.PUBLIC_VENDOR_TOOL['sha256'],
+                         'e1cc6b5b30c14f31017b4d2c460fe5642be18a6a36f50fb9d690711920ea1dbf')
+        self.assertEqual(image.PUBLIC_VENDOR_TOOL['size'], 1857584)
+        self.assertEqual(image.PUBLIC_VENDOR_TOOL['public_key_blocks'], 5)
+
+    def test_actual_recommended_portable_elf_and_wrapper_when_available(self):
+        default = Path('/home/valuxin/dev/owrt/asu-pbr-db-2026-10-21/vendor612-payload-measurement-v2/actual-recommended/result')
+        fixture = Path(os.environ.get('BUILDER_TEST_REC_VENDOR_TOOL', default / 'portable-vendor-elf.bin'))
+        wrapper_fixture = Path(os.environ.get('BUILDER_TEST_REC_VENDOR_WRAPPER', default / 'portable-wrapper.txt'))
+        if not fixture.is_file() or not wrapper_fixture.is_file():
+            self.skipTest('Set BUILDER_TEST_REC_VENDOR_TOOL/WRAPPER to independently measured portable files')
+        blob, wrapper = fixture.read_bytes(), wrapper_fixture.read_bytes()
+        entry = image.RECOMMENDED_PUBLIC_VENDOR_TOOL
+        self.assertEqual(len(blob), 1491024)
+        self.assertEqual(digest(blob), '6d84f24ff78aaa1155d5286787256dac07229c05cbce1d16376a7314d5236ef6')
+        self.assertEqual(len(wrapper), 236)
+        self.assertEqual(digest(wrapper), '5b57f0df74b479682186a0e6f9ea7215d0ccab060377a351296684762ccf93e9')
+        blocks = re.findall(rb'-----BEGIN RSA PRIVATE KEY-----.*?-----END RSA PRIVATE KEY-----(?:\r?\n)?', blob, re.S)
+        self.assertEqual(len(blocks), 6)
+        self.assertEqual({digest(block) for block in blocks}, {
+            '18394093ed2e8b8cdcd57b2fe2f1a48ba53ecfbc1119925e9368679677551bc2',
+            'bfb46a3e732cc02ba09f4e0047f2a46d3052fb3c1169db786e2db427864c431f',
+            '9638296ecc28bc6814843c82e3b7dd9e8681ec1a016a56d8a6df46c55f561a0b',
+            '369b70cb06c2d5cfb26101fc2c3110f97cc96d4cf2307e2c79112f1718505019',
+            'ecaff8d72ddec294aaf3654f1da9c1664054ff15d892728b646dd4944ad95dd5',
+            'e4c333f98cb7e0179cd64106df9d204b585884e28c83cdb9ebeadbacc1c4a1ac'})
+        path = self.root / entry['path']
+        path.parent.mkdir(parents=True)
+        path.write_bytes(blob)
+        visible = path.with_name('dlink-sge-image')
+        visible.write_bytes(wrapper)
+        image.verify_reviewed_vendor_tool(path, entry)
+        for bad in (blob[:-1] + bytes([blob[-1] ^ 1]), blob[:-1], blob + blocks[0]):
+            path.write_bytes(bad)
+            with self.assertRaises(ValueError):
+                image.verify_reviewed_vendor_tool(path, entry)
+        path.write_bytes(blob)
+        for bad in (wrapper[:-1] + b'!', wrapper + b'!', b'-----BEGIN OPENSSH PRIVATE KEY-----'):
+            visible.write_bytes(bad)
+            with self.assertRaises(ValueError):
+                image.verify_reviewed_vendor_tool(path, entry)
+        visible.unlink()
+        with self.assertRaises(ValueError):
+            image.verify_reviewed_vendor_tool(path, entry)
+        visible.symlink_to(wrapper_fixture)
+        with self.assertRaises(ValueError):
+            image.verify_reviewed_vendor_tool(path, entry)
 
     def test_vendor_exception_requires_reapproved_receipt_digest(self):
         self.proof['reviewed_public_vendor_tools'] = [copy.deepcopy(image.PUBLIC_VENDOR_TOOL)]
@@ -179,7 +298,7 @@ class BuilderImageTests(unittest.TestCase):
         entry.update(sha256=digest(public_fixture), size=len(public_fixture))
         proof = self.proof | {'reviewed_public_vendor_tools': [entry]}
         files = self.files | {entry['path']: public_fixture}
-        with patch.object(image, 'PUBLIC_VENDOR_TOOL', entry):
+        with patch.object(image, 'REVIEWED_PUBLIC_VENDOR_TOOLS', (('66', entry),)):
             tree = image.unpack(self.make_archive(files), self.root / 'vendor-unpacked')
             result = image.scan_tree(tree, proof)
             self.assertEqual(result['reviewed_public_vendor_tools'], [entry])
@@ -192,7 +311,8 @@ class BuilderImageTests(unittest.TestCase):
                     image.scan_tree(tree, proof)
                 path.write_bytes(public_fixture)
             for name, contents in [('other-tool.bin', public_fixture), ('key-build', b'native secret'),
-                                   ('innocent.txt', b'-----BEGIN OPENSSH PRIVATE KEY-----')]:
+                                   ('innocent.txt', b'-----BEGIN OPENSSH PRIVATE KEY-----'),
+                                   ('staging_dir/host/bin/dlink-sge-image', public_fixture)]:
                 other = tree / name
                 other.write_bytes(contents)
                 with self.assertRaises(ValueError):

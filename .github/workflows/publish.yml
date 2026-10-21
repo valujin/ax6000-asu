@@ -68,6 +68,7 @@ jobs:
             "$image" python -c '
           import pathlib,asu,fastapi,docker,redis
           import ops.immutable_mirror,ops.promote,ops.builder_image
+          import ops.hosted_context,ops.hosted_inspection,ops.native_acceptance
           for path in pathlib.Path("/app/ops").glob("*.py"):
               compile(path.read_bytes(),str(path),"exec")
           print("Pinned runtime imports passed; no catalog, worker, API or Docker socket activated")

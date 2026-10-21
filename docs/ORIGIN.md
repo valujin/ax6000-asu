@@ -43,11 +43,13 @@ APK binary in `ASU_MIRROR_APK_SHA256`. The registry is explicit operator trust
 input; the public request cannot select an upstream URL or arbitrary filesystem
 path. See [the mirror contract](../ops/MIRROR.md).
 
-The final runtime image contains exactly the three operator modules
-`ops/immutable_mirror.py`, `ops/promote.py`, and `ops/builder_image.py` under
-`/app/ops`, with `/app` on `PYTHONPATH`. No package installation is needed at
-container startup. A host APK binary must also run against the pinned runtime's
-libraries; a successful build in another image alone is insufficient evidence.
+The final runtime image contains the operator modules `ops/immutable_mirror.py`,
+`ops/promote.py`, and `ops/builder_image.py`, plus their native acceptance and
+hosted context helpers `ops/hosted_context.py`, `ops/hosted_inspection.py`, and
+`ops/native_acceptance.py`, under `/app/ops`, with `/app` on `PYTHONPATH`. The
+standalone ImageBuilder smoke CLI is not bundled. No package installation is
+needed at container startup. A host APK binary must also run against the pinned
+runtime's libraries; a successful build in another image alone is insufficient evidence.
 The separately reviewed APK 3.0.5 binary has been checked with `--version` inside
 this exact pinned CPython runtime, nonroot with a read-only root and no network.
 

@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "kind": "ax6000-asu-hosted-context-v1",
+  "producer_commit": "2a96db1b7163f37222a464b0795b8502e23b9e88",
+  "producer_seed": "19f59b194c1ea42734153adbf588af3de97081cfcc6aeb829447a17b60997228",
+  "identity": null,
+  "receipts": {
+    "completion": null,
+    "api": null,
+    "download": null,
+    "kernel_witness": null,
+    "overlay": null,
+    "persisted_ib": null,
+    "native_acceptance": null,
+    "native_evidence": null,
+    "independent_verification": null
+  },
+  "native_inputs": {
+    "profile.json": null,
+    "lock.json": null,
+    "firmware-manifest.json": null,
+    "build.config": null
+  },
+  "sdk_archive": null,
+  "functional_kernel": null,
+  "tools": {
+    "fwtool": null,
+    "unsquashfs4": null,
+    "jsmin": null
+  },
+  "pbr_archives": {
+    "pbr": null,
+    "luci-app-pbr": null
+  }
+}

@@ -44,6 +44,29 @@ PUBLIC_VENDOR_TOOL = {
     'source_implementation_sha256': '639dcee26d80c4dd1b9a60799b45a29a3b2cff081fb4f31b5a4ad608384cf112',
     'public_key_blocks': 5,
 }
+RECOMMENDED_PUBLIC_VENDOR_TOOL = {
+    'path': 'staging_dir/host/bin/.dlink-sge-image.bin',
+    'sha256': '6d84f24ff78aaa1155d5286787256dac07229c05cbce1d16376a7314d5236ef6',
+    'size': 1491024,
+    'classification': 'public-upstream-vendor-factory-keys',
+    'source_repository': 'https://git.openwrt.org/project/firmware-utils.git',
+    'source_commit': '6a87eaf434cb89d4eba0b811a4b5d158fd9c519f',
+    'source_header_path': 'src/dlink-sge-image.h',
+    'source_header_sha256': '1455ab4366e869ea7afe3fecbe8b20baa5c9a2c105dc18c6e3dc9bfc55483e87',
+    'source_implementation_path': 'src/dlink-sge-image.c',
+    'source_implementation_sha256': 'b9ee120c68b3d1ea2f479ee15f646a0aa3343aa36a92db7a4d647cf91bad43b3',
+    'public_key_blocks': 6,
+}
+RECOMMENDED_VENDOR_WRAPPER = {
+    'path': 'staging_dir/host/bin/dlink-sge-image',
+    'sha256': '5b57f0df74b479682186a0e6f9ea7215d0ccab060377a351296684762ccf93e9',
+    'size': 236,
+}
+# Literal records only: each additional portable payload requires independent
+# exact-byte/source review before a code change. A source ELF or an older SDK is
+# not approval of a new ImageBuilder payload. No LATEST payload is approved.
+REVIEWED_PUBLIC_VENDOR_TOOLS = (('66', PUBLIC_VENDOR_TOOL),
+                                ('612-recommended', RECOMMENDED_PUBLIC_VENDOR_TOOL))
 
 
 def require(value, message):
@@ -91,23 +114,31 @@ def load_pinned(path, expected_sha):
 
 
 def reviewed_vendor_tools(proof):
-    """No generic marker bypass: one fixed, separately approved upstream blob."""
+    """At most one exact reviewed blob, bound to its independently proved cohort."""
     entries = proof.get('reviewed_public_vendor_tools', [])
     require(isinstance(entries, list) and len(entries) <= 1, 'Invalid reviewed public vendor-tool inventory')
-    require(not entries or (isinstance(entries[0], dict) and entries[0] == PUBLIC_VENDOR_TOOL),
-            'Unrecognized public vendor-tool exception or source provenance')
+    require(not entries or (isinstance(entries[0], dict) and any(
+                proof.get('cohort') == cohort and entries[0] == record
+                for cohort, record in REVIEWED_PUBLIC_VENDOR_TOOLS)),
+            'Unrecognized public vendor-tool exception, cohort or source provenance')
     return {entry['path']: entry for entry in entries}
 
 
 def verify_reviewed_vendor_tool(path, approved):
-    require(approved == PUBLIC_VENDOR_TOOL, 'Unrecognized reviewed vendor-tool bytes/provenance')
-    path = regular(path, PUBLIC_VENDOR_TOOL['size'])
+    require(any(approved == record for _, record in REVIEWED_PUBLIC_VENDOR_TOOLS),
+            'Unrecognized reviewed vendor-tool bytes/provenance')
+    path = regular(path, approved['size'])
     require(path.stat().st_size == approved['size'] and sha256(path) == approved['sha256'],
             'Reviewed public vendor-tool bytes differ')
     with path.open('rb') as stream:
         header = stream.read(20)
     require(header[:7] == b'\x7fELF\x02\x01\x01' and header[18:20] == b'\x3e\x00',
             'Reviewed public vendor tool is not the expected x86-64 ELF')
+    if approved == RECOMMENDED_PUBLIC_VENDOR_TOOL:
+        wrapper = RECOMMENDED_VENDOR_WRAPPER
+        visible = regular(path.with_name(PurePosixPath(wrapper['path']).name), wrapper['size'])
+        require(visible.stat().st_size == wrapper['size'] and sha256(visible) == wrapper['sha256'],
+                'Reviewed REC vendor-tool wrapper bytes differ')
 
 
 def validate_inputs(archive, archive_sha, proof_path, proof_sha, profile_path, public_key_path):

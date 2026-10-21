@@ -355,6 +355,8 @@ def unpack_outputs(archive, destination):
 
 
 def load_context(args, work):
+    require(bool(getattr(args, 'source', None)) != bool(getattr(args, 'hosted_context', None)),
+            'Choose exactly one actual native source or explicit hosted context')
     profile = promotion.read_json(args.profile)
     approval = builder.validate_inputs(args.archive, args.archive_sha256, args.builder_approval,
                                       args.builder_approval_sha256, args.profile, args.public_key)
@@ -382,8 +384,15 @@ def load_context(args, work):
     subprocess.run([str(usign), '-V', '-m', str(snapshot), '-p', str(promotion.regular(args.public_key)),
                     '-x', str(promotion.regular(args.snapshot_signature))], check=True, timeout=60,
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    source = Path(args.source).absolute()
-    require(subprocess.check_output(['git', '-C', str(source), 'rev-parse', 'HEAD'], text=True).strip() == profile['firmware']['commit'], 'Native source commit differs')
+    hosted = None
+    if getattr(args, 'hosted_context', None) is not None:
+        hosted_module = module(HERE / 'hosted_context.py', 'smoke_hosted_context')
+        hosted = hosted_module.load(args.hosted_context, args.hosted_context_sha256, cohort=args.cohort,
+                                   profile=profile, native=native, raw=args.raw, recipe=args.package_repository)
+        source = None
+    else:
+        source = Path(args.source).absolute()
+        require(subprocess.check_output(['git', '-C', str(source), 'rev-parse', 'HEAD'], text=True).strip() == profile['firmware']['commit'], 'Native source commit differs')
     tree = builder.unpack(args.archive, Path(work) / 'unpacked')
     builder.scan_tree(tree, approval)
     attestation = promotion.read_json(tree / 'ax6000-imagebuilder.json')
@@ -399,13 +408,24 @@ def load_context(args, work):
         controls[name], packages[name] = control, path
     require(controls and controls.get('kernel', {}).get('Version') == profile['firmware']['kernel_version'], 'Missing matching native bank')
     return {'profile': profile, 'approval': approval, 'native': native, 'loaded': loaded, 'tree': tree,
-            'attestation': attestation, 'controls': controls, 'packages': packages, 'source': source}
+            'attestation': attestation, 'controls': controls, 'packages': packages, 'source': source,
+            'hosted_context': hosted}
 
 
 def prepare_native(args, context, recipe):
     profile, native, source = context['profile'], context['native'], context['source']
     verifier = promotion.load_module(Path(recipe) / 'scripts/verify-firmware.py', 'smoke_native_verifier')
-    overlay = promotion.rootfs_overlay(recipe, source, profile, native, context['attestation'])
+    hosted = context.get('hosted_context')
+    if hosted is not None:
+        helper = promotion.load_module(Path(recipe) / 'scripts/imagebuilder.py', 'smoke_hosted_imagebuilder')
+        helper.verify_tree(context['tree'], profile, args.public_key, args.usign, source=None,
+                           native_packages=sorted(Path(args.raw).joinpath('bin').rglob('*.apk')),
+                           apk=promotion.pinned_tool(args.apk, args.apk_sha256),
+                           public_apk_key=Path(recipe) / 'keys/repository-apk.pem')
+        hosted.verify_tree(context['tree'], context['attestation'])
+        overlay = hosted.overlay
+    else:
+        overlay = promotion.rootfs_overlay(recipe, source, profile, native, context['attestation'])
     defaults = {}
     for layout, evidence in native['layouts'].items():
         manifest_record = evidence['root']['package_manifest']
@@ -417,6 +437,15 @@ def prepare_native(args, context, recipe):
         defaults[layout] = {name: version for name, version in actual.items() if name != 'tailscale'}
         validate_manifest(defaults[layout], defaults[layout], context['controls'], profile['firmware']['kernel_version'], profile.get('package_manager', 'opkg'))
     tools = {}
+    if hosted is not None:
+        require(args.native_source_prefix is None, 'Hosted mode cannot use a native source namespace override')
+        context.update(verifier=verifier, overlay=overlay, defaults=defaults,
+                       tools={name: hosted.tools[name] for name in ('fwtool', 'unsquashfs4')},
+                       kernel=hosted.kernel, kernel_config=hosted.kernel_config,
+                       native_lock=promotion.read_json(Path(args.raw) / 'lock.json'),
+                       native_source_mapping=hosted.scope,
+                       apk=promotion.pinned_tool(args.apk, args.apk_sha256))
+        return context
     proof_prefix = str(source) if args.native_source_prefix is None else args.native_source_prefix
     mapping = {'proof_source_prefix': proof_prefix, 'actual_source': str(source), 'tools': {}}
     for name in ('fwtool', 'unsquashfs4'):
@@ -484,10 +513,17 @@ def inspect_artifacts(layout, directory, context, receipt_parent, selection):
     kwargs = {'feature_lock': context['native_lock'], 'feature_source': context['source']}
     if profile.get('package_manager', 'opkg') == 'apk':
         kwargs['apk'] = context['apk']
-    root_record = verifier.inspect_root(root, layout, context['tools']['unsquashfs4'], profile,
-                                        context['controls'], context['packages'], expected_files,
-                                        native['layouts'][layout]['root']['trusted_key_fingerprint'],
-                                        context['kernel_config'], actual, **kwargs)
+    if context.get('hosted_context') is not None:
+        inspector = module(HERE / 'hosted_inspection.py', 'smoke_hosted_inspection')
+        root_record = inspector.inspect_hosted_root(verifier, root, layout, context['tools']['unsquashfs4'], profile,
+            context['controls'], context['packages'], expected_files,
+            native['layouts'][layout]['root']['trusted_key_fingerprint'], context['kernel_config'], actual,
+            apk=context['apk'], hosted_context=context['hosted_context'])
+    else:
+        root_record = verifier.inspect_root(root, layout, context['tools']['unsquashfs4'], profile,
+                                            context['controls'], context['packages'], expected_files,
+                                            native['layouts'][layout]['root']['trusted_key_fingerprint'],
+                                            context['kernel_config'], actual, **kwargs)
     compare_native_root(root_record, native['layouts'][layout]['root'])
     (directory / 'root-inspection.json').write_text(json.dumps({'root': root_record, 'device_tree': dtb, 'kernel': kernel}, indent=2, sort_keys=True) + '\n')
     return {'exit_codes': {'info': 0, 'manifest': 0, 'image': 0},
@@ -556,11 +592,15 @@ def main(argv=None):
                  'native-evidence-sha256', 'snapshot-sha256', 'usign-sha256', 'recipe-commit'):
         parser.add_argument('--' + name, required=True)
     for name in ('archive', 'profile', 'builder-approval', 'builder-load-receipt', 'native-evidence', 'snapshot-manifest',
-                 'snapshot-signature', 'public-key', 'usign', 'source', 'raw', 'package-repository', 'output'):
+                 'snapshot-signature', 'public-key', 'usign', 'raw', 'package-repository', 'output'):
         parser.add_argument('--' + name, type=Path, required=True)
     parser.add_argument('--apk', type=Path)
     parser.add_argument('--apk-sha256')
     parser.add_argument('--native-source-prefix', help='Canonical absolute source prefix recorded inside native proof (default: actual host source)')
+    context_choice = parser.add_mutually_exclusive_group(required=True)
+    context_choice.add_argument('--source', type=Path)
+    context_choice.add_argument('--hosted-context', type=Path)
+    parser.add_argument('--hosted-context-sha256')
     parser.add_argument('--run', action='store_true', help='Explicitly run actual rootless make operations; default prints validated plan')
     parser.add_argument('--lock-proof', type=Path)
     parser.add_argument('--lock-proof-sha256')
@@ -582,6 +622,8 @@ def main(argv=None):
                                         'pending_operations': ['manifest', 'image'],
                                         'package_selection': 'Requires successful matching make info; exclude inherited defaults absent from desired packages'}
                                 for layout, packages in context['defaults'].items()}}
+            if context.get('hosted_context') is not None:
+                plan['hosted_context'] = context['hosted_context'].scope
             if not args.run:
                 print(json.dumps(plan, indent=2, sort_keys=True))
                 return
@@ -603,6 +645,8 @@ def main(argv=None):
                        'hardkill_lock_proof_sha256': args.lock_proof_sha256, 'lock_device': lock_stat.st_dev,
                        'lock_inode': lock_stat.st_ino, 'overlay_paths': sorted(context['overlay']), 'layouts': {}}
             receipt['native_source_mapping'] = context['native_source_mapping']
+            if context.get('hosted_context') is not None:
+                receipt['hosted_context'] = context['hosted_context'].scope
             for layout in sorted(context['defaults']):
                 receipt['layouts'][layout] = run_layout(layout, output, args, context, lock_stat)
             (output / 'evidence.json').write_text(json.dumps(receipt, indent=2, sort_keys=True) + '\n')
