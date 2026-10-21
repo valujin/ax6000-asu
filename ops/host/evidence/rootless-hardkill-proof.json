@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "kind": "ax6000-rootless-lock-hardkill",
+  "ok": true,
+  "engine_id": "c592b58c-bc7e-40a0-91b5-29d5b29387a1",
+  "lock_device": 2049,
+  "lock_inode": 8156582,
+  "held_after_worker_death": true,
+  "released_after_container_death": true,
+  "worker_exit": -9,
+  "container_uid": 1000,
+  "image_id": "sha256:bdf57e528e45e4433820e045b29b4597825a1c9e38353532d90a01445013f82e",
+  "logs": "LOCK_HELD\n"
+}

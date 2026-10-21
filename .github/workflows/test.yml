@@ -1,62 +1,137 @@
-name: Test Pull Request
+name: AX6000 policy and operator tests
 
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      legacy_tests:
+        description: Also run retained upstream unit/fixture tests; never starts an ImageBuilder
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-on:
-  push:
-    branches:
-      - main
-  pull_request:
-    branches:
-      - main
-
 env:
-  TERM: xterm-color
-  PY_COLORS: 1
-  LOG_LEVEL: DEBUG
+  PYTHONDONTWRITEBYTECODE: "1"
+  UV_PYTHON_DOWNLOADS: never
+  RECIPE_66: ${{ vars.AX6000_PACKAGES_RECIPE_COMMIT }}
+  RECIPE_612: ${{ vars.AX6000_PACKAGES_612_RECIPE_COMMIT }}
 
 jobs:
-  build:
+  policy:
     runs-on: ubuntu-24.04
-    strategy:
-      fail-fast: false
-      matrix:
-        python-version:
-          - "3.13"
-          - "3.14"
-
-    name: Python ${{ matrix.python-version }}
-
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          python-version: ${{ matrix.python-version }}
-
-      - name: Install uv
-        uses: astral-sh/setup-uv@v5
-
-      - name: Display Python version
-        run: python -c "import sys; print(sys.version)"
-
-      - name: Install dependencies
-        run: uv sync --extra dev
-
-      - name: Lint with ruff
-        run: uv run ruff check .
-
-      - name: Stylecheck with ruff
-        run: uv run ruff format --check .
-
-      - name: Test with pytest
+          persist-credentials: false
+      - name: Require explicit reviewed cross-repository recipe pins
         run: |
-          podman network create asu-build
-          podman system service --time=0 "unix://$(pwd)/podman.sock" &
-          uv run coverage run -m pytest -vv --runslow
-          uv run coverage xml
-
-      - name: Codecov
-        uses: codecov/codecov-action@v4
+          for pin in "$RECIPE_66" "$RECIPE_612"; do
+            [[ "$pin" =~ ^[a-f0-9]{40}$ ]] || { echo 'Set both AX6000_PACKAGES_RECIPE_COMMIT and AX6000_PACKAGES_612_RECIPE_COMMIT to reviewed full commit SHAs.' >&2; exit 1; }
+          done
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: valujin/ax6000-packages
+          ref: ${{ vars.AX6000_PACKAGES_RECIPE_COMMIT }}
+          path: .ci-recipes/packages
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: valujin/ax6000-packages-6.12
+          ref: ${{ vars.AX6000_PACKAGES_612_RECIPE_COMMIT }}
+          path: .ci-recipes/packages612
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14.8"
+          check-latest: false
+      - name: Record the selected interpreter library directory for bounded descendants
+        run: |
+          printf 'ASU_CI_PYTHON_LIBRARY_PATH=%s\n' "$(python -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')" >> "$GITHUB_ENV"
+      - name: Verify recipe identities and install disposable runner tool prerequisites
+        run: |
+          [[ $(git -C .ci-recipes/packages rev-parse HEAD) == "$RECIPE_66" ]]
+          [[ $(git -C .ci-recipes/packages612 rev-parse HEAD) == "$RECIPE_612" ]]
+          [[ -f .ci-recipes/packages612/scripts/build-apk-host.sh && -f .ci-recipes/packages612/scripts/package_format.py ]]
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build pkg-config libjson-c-dev \
+            libssl-dev zlib1g-dev libzstd-dev squashfs-tools zstd xz-utils curl wget openssl
+      - name: Bootstrap the exact hashed uv wheel in a temporary venv
+        run: |
+          python -m venv "$RUNNER_TEMP/uv-bootstrap"
+          wheel="$RUNNER_TEMP/uv-0.9.12-py3-none-manylinux_2_17_x86_64.manylinux2014_x86_64.whl"
+          curl --fail --silent --show-error --location --max-time 120 --max-filesize 21731493 \
+            https://files.pythonhosted.org/packages/5f/4c/f82603979cc94dec109c85f46a53597882c8e7de70518542d795adc829e2/uv-0.9.12-py3-none-manylinux_2_17_x86_64.manylinux2014_x86_64.whl \
+            --output "$wheel"
+          printf '822ea5a36e261f94a71c458ee79a8837d0a00d0b9b185a8f68fc0a9d452b1582  %s\n' "$wheel" | sha256sum --check --strict
+          "$RUNNER_TEMP/uv-bootstrap/bin/python" -m pip install --no-index --no-deps "$wheel"
+          "$RUNNER_TEMP/uv-bootstrap/bin/uv" --version
+      - name: Build independent host APK and official usign
+        run: |
+          helper=.ci-recipes/packages612/scripts/hosted-publication.py
+          python "$helper" -- bash .ci-recipes/packages612/scripts/build-apk-host.sh --work-dir "$RUNNER_TEMP/apk-host"
+          pin=f1f65026a94137c91b5466b149ef3ea3f20091e9
+          git init "$RUNNER_TEMP/usign-source"
+          git -C "$RUNNER_TEMP/usign-source" fetch --depth 1 https://github.com/openwrt/usign.git "$pin"
+          git -C "$RUNNER_TEMP/usign-source" checkout --detach FETCH_HEAD
+          [[ $(git -C "$RUNNER_TEMP/usign-source" rev-parse HEAD) == "$pin" ]]
+          python "$helper" -- bash .ci-recipes/packages612/scripts/resource-limit.sh --jobs 1 -- \
+            cmake -S "$RUNNER_TEMP/usign-source" -B "$RUNNER_TEMP/usign-build"
+          python "$helper" -- bash .ci-recipes/packages612/scripts/resource-limit.sh --jobs 1 -- \
+            cmake --build "$RUNNER_TEMP/usign-build" --parallel 1
+      - name: Install only the frozen project lock
+        run: |
+          python .ci-recipes/packages612/scripts/hosted-publication.py -- \
+            env LD_LIBRARY_PATH="$ASU_CI_PYTHON_LIBRARY_PATH" UV_PROJECT_ENVIRONMENT="$RUNNER_TEMP/asu-ci-venv" UV_CACHE_DIR="$RUNNER_TEMP/uv-cache" \
+            "$RUNNER_TEMP/uv-bootstrap/bin/uv" sync --frozen --extra dev --no-editable --python "$(command -v python)"
+          git diff --exit-code -- pyproject.toml uv.lock
+      - name: Check runtime lint and core formatting
+        run: |
+          "$RUNNER_TEMP/asu-ci-venv/bin/ruff" check asu tests
+          "$RUNNER_TEMP/asu-ci-venv/bin/ruff" check ops --select F,E9
+          "$RUNNER_TEMP/asu-ci-venv/bin/ruff" format --check asu tests
+      - name: Run AX6000 ASGI, policy, cache, engine and overlay tests
+        run: |
+          python .ci-recipes/packages612/scripts/hosted-publication.py -- \
+            env LD_LIBRARY_PATH="$ASU_CI_PYTHON_LIBRARY_PATH" "$RUNNER_TEMP/asu-ci-venv/bin/python" -m pytest -q tests/ax6000 \
+            --junitxml="$RUNNER_TEMP/ax6000-junit.xml"
+      - name: Run operator tests with actual host signatures and APK metadata
+        run: |
+          python .ci-recipes/packages612/scripts/hosted-publication.py -- \
+            env LD_LIBRARY_PATH="$ASU_CI_PYTHON_LIBRARY_PATH" PROMOTE_TEST_RECIPES="$GITHUB_WORKSPACE/.ci-recipes" \
+            USIGN="$RUNNER_TEMP/usign-build/usign" APK="$RUNNER_TEMP/apk-host/build/src/apk" \
+            MIRROR_TEST_APK="$RUNNER_TEMP/apk-host/build/src/apk" PYTHONPATH="$GITHUB_WORKSPACE" \
+            "$RUNNER_TEMP/asu-ci-venv/bin/python" -m unittest discover -s ops/tests -v
+          python .ci-recipes/packages612/scripts/hosted-publication.py -- \
+            env LD_LIBRARY_PATH="$ASU_CI_PYTHON_LIBRARY_PATH" "$RUNNER_TEMP/asu-ci-venv/bin/python" -m unittest discover -s ops -p test_builder_image.py -v
+      - name: Verify the actual pinned frontend without production networks
+        run: |
+          docker pull nginx@sha256:970364228b1e4f932abc22d321932816782cca8a20b85a77552a7cfe9acfb3b5
+          FRONTEND_TEST_DOCKER=1 "$RUNNER_TEMP/asu-ci-venv/bin/python" -m unittest discover -s ops/tests -p test_frontend.py -v
+      - name: Retained upstream unit and fixture regression tests
+        if: github.event_name == 'workflow_dispatch' && inputs.legacy_tests
+        run: |
+          python .ci-recipes/packages612/scripts/hosted-publication.py -- \
+            env LD_LIBRARY_PATH="$ASU_CI_PYTHON_LIBRARY_PATH" "$RUNNER_TEMP/asu-ci-venv/bin/python" -m pytest -q tests --junitxml="$RUNNER_TEMP/upstream-junit.xml"
+      - name: Keep test reports and trusted host bootstrap evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ax6000-ci-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/ax6000-junit.xml
+            ${{ runner.temp }}/upstream-junit.xml
+            ${{ runner.temp }}/apk-host/tool-proof.json
+            ${{ runner.temp }}/apk-host/build.log
+          retention-days: 7
+          if-no-files-found: warn

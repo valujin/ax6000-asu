@@ -11,12 +11,19 @@ from typing import Union
 from time import perf_counter
 
 from rq import get_current_job
-from podman import errors
+from docker import errors
 from rq.utils import parse_timeout
 
 from asu.build_request import BuildRequest
 from asu.config import settings
-from asu.package_changes import apply_package_changes
+from asu.ax6000_policy import (
+    get_catalog,
+    validate_request,
+    require,
+    validate_manifest,
+    image_package_specs,
+    normalize_emitted_manifest,
+)
 from asu.repositories import (
     merge_repositories,
     validate_repos,
@@ -31,11 +38,9 @@ from asu.util import (
     error_log,
     fingerprint_pubkey_usign,
     get_branch,
-    get_container_version_tag,
     get_packages_hash,
-    get_podman,
+    get_engine,
     get_request_hash,
-    is_snapshot_build,
     parse_manifest,
     report_error,
     run_cmd,
@@ -56,7 +61,7 @@ def _cleanup_container(container):
         log.warning(f"Failed to remove container {container.id[:12]}: {e}")
 
 
-def _make_tar(files: dict[str, str | bytes]) -> bytes:
+def _make_tar(files: dict[str, str | bytes], modes=None) -> bytes:
     """Create an in-memory tar archive from a dict of {path: content}.
 
     Args:
@@ -72,6 +77,7 @@ def _make_tar(files: dict[str, str | bytes]) -> bytes:
             data = content.encode("utf-8") if isinstance(content, str) else content
             info = tarfile.TarInfo(name=name)
             info.size = len(data)
+            info.mode = (modes or {}).get(name, 0o644)
             tar.addfile(info, BytesIO(data))
     return buf.getvalue()
 
@@ -130,7 +136,7 @@ def inject_files(container, build_request, job=None, apk_mode: bool | None = Non
         )
 
 
-def _build(build_request: BuildRequest, job=None):
+def _build(build_request: BuildRequest, job=None, workspace=None, engine=None):
     """Build image request and setup ImageBuilders automatically
 
     The `request` dict contains properties of the requested image.
@@ -141,9 +147,17 @@ def _build(build_request: BuildRequest, job=None):
 
     build_start: float = perf_counter()
 
+    catalog = get_catalog()
+    require(catalog is not None, "Build requires an operator-promoted AX6000 catalog")
+    require(
+        not getenv("BUILD_KEY"),
+        "Worker image-certificate signing is not configured; BUILD_KEY is unsupported",
+    )
+    normalized = validate_request(catalog, build_request.model_dump())
+    build_request = BuildRequest(**normalized)
     request_hash = get_request_hash(build_request)
 
-    bin_dir: Path = settings.public_path / "store" / request_hash
+    bin_dir: Path = Path(workspace) / request_hash
     bin_dir.mkdir(parents=True, exist_ok=True)
     log.debug(f"Bin dir: {bin_dir}")
 
@@ -155,47 +169,30 @@ def _build(build_request: BuildRequest, job=None):
 
     log.debug(f"Building {build_request}")
 
-    podman = get_podman()
+    require(engine is not None, "Verified rootless engine required")
 
-    log.debug(f"Podman version: {podman.version()}")
+    log.debug(f"Build engine version: {engine.version()}")
 
-    container_version_tag = get_container_version_tag(build_request.version)
-    log.debug(
-        f"Container version: {container_version_tag} (requested {build_request.version})"
-    )
-
+    image = catalog.data["imagebuilder"]["image"]
     environment: dict[str, str] = {}
-
-    image = f"{settings.base_container}:{build_request.target.replace('/', '-')}-{container_version_tag}"
-
-    if is_snapshot_build(build_request.version):
-        environment.update(
-            {
-                "TARGET": build_request.target,
-                "VERSION_PATH": get_branch(build_request.version)
-                .get("path", "")
-                .replace("{version}", build_request.version),
-            }
-        )
-
     job.meta["imagebuilder_status"] = "container_setup"
     job.save_meta()
 
-    log.info(f"Pulling {image}...")
+    log.info(f"Verifying local ImageBuilder {image}...")
     try:
-        podman.images.pull(image)
+        engine.images.pull(image)
     except errors.ImageNotFound:
         report_error(
             job,
             f"Image not found: {image}. If this version was just released, please try again in a few hours as it may take some time to become fully available.",
         )
-    log.info(f"Pulling {image}... done")
+    log.info(f"Verifying local ImageBuilder {image}... done")
 
     mounts: list[dict[str, Union[str, bool]]] = [
         {"type": "tmpfs", "target": f"/builder/{request_hash}"},
     ]
 
-    container = podman.containers.create(
+    container = engine.containers.create(
         image,
         command=["sleep", str(parse_timeout(settings.job_timeout))],
         mounts=mounts,
@@ -209,32 +206,44 @@ def _build(build_request: BuildRequest, job=None):
     )
     try:
         container.start()
+        from asu.docker_engine import verify_runtime_limits, wait_for_global_lock
 
-        if is_snapshot_build(build_request.version):
-            log.info("Running setup.sh for ImageBuilder")
-            returncode, job.meta["stdout"], job.meta["stderr"] = run_cmd(
-                container, ["sh", "setup.sh"]
-            )
-            if returncode:
-                report_error(job, f"Could not set up ImageBuilder ({returncode=})")
+        wait_for_global_lock(container)
 
-        # Detect the package manager only when something needs it: custom
-        # repositories (inject_files) or cache URL rewriting below.
-        apk_mode = None
-        if build_request.repositories or settings.cache_url:
-            apk_mode = _detect_apk_mode(container)
+        job.meta["runtime_limits"] = verify_runtime_limits(container)
+        job.save_meta()
 
-        inject_files(container, build_request, job, apk_mode=apk_mode)
+        # No moving setup.sh, arbitrary repositories, keys, defaults or proxy rewriting.
+        manager = catalog.data["package_manager"]
+        apk_mode = _detect_apk_mode(container)
+        require(
+            apk_mode == (manager == "apk"),
+            "ImageBuilder package manager differs from catalog",
+        )
+        keys = catalog.data["repository_keys"]
+        repo_file = "repositories" if apk_mode else "repositories.conf"
+        repo_content = catalog.data["repositories_conf"]
+        if not apk_mode:
+            repo_content += "\nsrc imagebuilder file:packages\n"
+        files = {
+            repo_file: repo_content,
+        }
+        from asu.overlay_policy import promoted_overlay, verify_sysupgrade_overlay
 
-        # If a caching proxy is configured, rewrite repository URLs
-        # from https://host/path to http://cache/host/path
-        if settings.cache_url:
-            cache_host = settings.cache_url.rstrip("/")
-            repo_file = "repositories" if apk_mode else "repositories.conf"
-            run_cmd(
-                container,
-                ["sed", "-i", f"s|https://|{cache_host}/|g", repo_file],
-            )
+        overlay = promoted_overlay(catalog)
+        files.update({"asu-files/" + path: value[0] for path, value in overlay.items()})
+        modes = {"asu-files/" + path: value[1] for path, value in overlay.items()}
+        for index, key in enumerate(keys):
+            if apk_mode:
+                require(
+                    key.strip().startswith("-----BEGIN PUBLIC KEY-----"),
+                    "APK requires PEM verification keys",
+                )
+                files["keys/approved-" + str(index) + ".pem"] = key
+            else:
+                fingerprint = fingerprint_pubkey_usign(key)
+                files["keys/" + fingerprint] = key
+        container.put_archive("/builder/", _make_tar(files, modes))
 
         returncode, job.meta["stdout"], job.meta["stderr"] = run_cmd(
             container, ["make", "info"]
@@ -247,6 +256,10 @@ def _build(build_request: BuildRequest, job=None):
             1
         )
 
+        require(
+            version_code == catalog.data["firmware"]["version_code"],
+            "ImageBuilder revision differs from catalog",
+        )
         if requested := build_request.version_code:
             if version_code != requested:
                 report_error(
@@ -269,7 +282,7 @@ def _build(build_request: BuildRequest, job=None):
             .split()
         )
 
-        apply_package_changes(build_request)
+        # Catalog policy deliberately keeps OPKG and the vendor package stack.
 
         extra_packages = (
             set(build_request.packages) - default_packages - profile_packages
@@ -290,6 +303,7 @@ def _build(build_request: BuildRequest, job=None):
             )
             log.debug(f"Diffed packages: {build_cmd_packages}")
 
+        build_cmd_packages = image_package_specs(catalog, build_cmd_packages)
         job.meta["imagebuilder_status"] = "validate_manifest"
         job.save_meta()
 
@@ -300,7 +314,6 @@ def _build(build_request: BuildRequest, job=None):
                 "manifest",
                 f"PROFILE={build_request.profile}",
                 f"PACKAGES={' '.join(build_cmd_packages)}",
-                "STRIP_ABI=1",
             ],
         )
 
@@ -309,13 +322,18 @@ def _build(build_request: BuildRequest, job=None):
         if returncode:
             report_error(job, check_package_errors(job.meta["stderr"]))
 
-        manifest: dict[str, str] = parse_manifest(job.meta["stdout"])
+        # Both managers emit actual indexed names. Never infer an ABI suffix or
+        # accept an ABI-free name unless that is the approved actual identity.
+        manifest: dict[str, str] = normalize_emitted_manifest(
+            catalog, parse_manifest(job.meta["stdout"])
+        )
         log.debug(f"Manifest: {manifest}")
 
         # Check if all requested packages are in the manifest
         if err := check_manifest(manifest, build_request.packages_versions):
             report_error(job, err)
 
+        validate_manifest(catalog, build_request.model_dump(), manifest)
         packages_hash: str = get_packages_hash(manifest.keys())
         log.debug(f"Packages Hash: {packages_hash}")
 
@@ -326,6 +344,7 @@ def _build(build_request: BuildRequest, job=None):
             f"PACKAGES={' '.join(build_cmd_packages)}",
             f"EXTRA_IMAGE_NAME={packages_hash[:12]}",
             f"BIN_DIR=/builder/{request_hash}",
+            "FILES=/builder/asu-files",
         ]
 
         if build_request.defaults:
@@ -354,6 +373,16 @@ def _build(build_request: BuildRequest, job=None):
             job.meta["build_cmd"],
             copy=["/builder/" + request_hash, bin_dir.parent],
         )
+        if returncode == 0:
+            job.meta["rootfs_overlay"] = verify_sysupgrade_overlay(
+                container,
+                catalog,
+                bin_dir,
+                request_hash,
+                manifest,
+                build_request.profile,
+            )
+            job.save_meta()
     finally:
         _cleanup_container(container)
 
@@ -376,92 +405,91 @@ def _build(build_request: BuildRequest, job=None):
     if build_request.profile not in json_content["profiles"]:
         report_error(job, "Profile not found in JSON file")
 
-    # get list of installable images to sign (i.e. don't sign kernel)
-    images = list(
-        map(
-            lambda i: i["name"],
-            filter(
-                lambda i: (
-                    i["type"]
-                    in ["sysupgrade", "factory", "combined", "combined-efi", "sdcard"]
-                ),
-                json_content["profiles"][build_request.profile]["images"],
-            ),
+    require(
+        json_content.get("target") == "mediatek/filogic"
+        and json_content.get("version_code")
+        == catalog.data["firmware"]["version_code"],
+        "Built image identity differs",
+    )
+    result_profile = json_content["profiles"][build_request.profile]
+    require(
+        result_profile.get("supported_devices")
+        == catalog.data["profiles"][build_request.profile]["supported_devices"],
+        "Built layout differs",
+    )
+    images_metadata = result_profile.get("images", [])
+    sysupgrade = [
+        x
+        for x in images_metadata
+        if x.get("type") == "sysupgrade" and x.get("filesystem") == "squashfs"
+    ]
+    require(len(sysupgrade) == 1, "Exactly one sysupgrade image required")
+    for record in images_metadata:
+        name = record.get("name", "")
+        require(
+            isinstance(name, str)
+            and Path(name).name == name
+            and name not in ("", ".", ".."),
+            "Unsafe output filename",
         )
+        output = bin_dir / name
+        require(output.is_file() and not output.is_symlink(), "Output image missing")
+        if record.get("type") == "sysupgrade":
+            import hashlib
+
+            require(
+                output.stat().st_size
+                <= catalog.data["profiles"][build_request.profile]["max_image_size"],
+                "Image exceeds layout partition bound",
+            )
+            with output.open("rb") as stream:
+                require(
+                    hashlib.file_digest(stream, "sha256").hexdigest()
+                    == record.get("sha256"),
+                    "Output image checksum differs",
+                )
+    from asu.manifest_policy import verify_emitted_manifest
+
+    manifest = verify_emitted_manifest(
+        catalog, build_request.model_dump(), bin_dir, manifest
     )
 
-    log.info(f"Signing images: {images}")
+    import hashlib
 
-    # job.meta["imagebuilder_status"] = "signing_images"
-    job.save_meta()
-
-    build_key = getenv("BUILD_KEY") or str(Path.cwd() / "key-build")
-
-    if Path(build_key).is_file():
-        log.info(f"Signing images with key {build_key}")
-        container = podman.containers.create(
-            image,
-            mounts=[
-                {
-                    "type": "bind",
-                    "source": build_key,
-                    "target": "/builder/key-build",
-                    "read_only": True,
-                },
-                {
-                    "type": "bind",
-                    "source": build_key + ".ucert",
-                    "target": "/builder/key-build.ucert",
-                    "read_only": True,
-                },
-                {
-                    "type": "bind",
-                    "source": str(bin_dir),
-                    "target": "/work",
-                    "read_only": False,
-                },
-            ],
-            user="root",
-            working_dir="/work",
-            environment={
-                "IMAGES_TO_SIGN": " ".join(images),
-                "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/builder/staging_dir/host/bin",
-            },
-            image_volume_mode="ignore",
-        )
-        try:
-            container.start()
-            returncode, job.meta["stdout"], job.meta["stderr"] = run_cmd(
-                container,
-                [
-                    "bash",
-                    "-c",
-                    (
-                        "env;"
-                        "for IMAGE in $IMAGES_TO_SIGN; do "
-                        "touch ${IMAGE}.test;"
-                        'fwtool -t -s /dev/null "$IMAGE" && echo "sign entfern";'
-                        'cp "/builder/key-build.ucert" "$IMAGE.ucert" && echo "moved";'
-                        'usign -S -m "$IMAGE" -s "/builder/key-build" -x "$IMAGE.sig"  && echo "usign";'
-                        'ucert -A -c "$IMAGE.ucert" -x "$IMAGE.sig" && echo "ucert";'
-                        'fwtool -S "$IMAGE.ucert" "$IMAGE" && echo "fwtool";'
-                        "done"
-                    ),
-                ],
+    for record in images_metadata:
+        output = bin_dir / record["name"]
+        with output.open("rb") as stream:
+            record["sha256"] = hashlib.file_digest(stream, "sha256").hexdigest()
+        record["size"] = output.stat().st_size
+        if record.get("type") == "sysupgrade":
+            require(
+                record["size"]
+                <= catalog.data["profiles"][build_request.profile]["max_image_size"],
+                "Signed image exceeds partition bound",
             )
-        finally:
-            _cleanup_container(container)
-        job.save_meta()
-    else:
-        log.warning("No build key found, skipping signing")
-
+    # Persist checksums for the actual (optionally signed) bytes, before the
+    # directory becomes downloadable. The API response is flattened afterward.
+    json_content["ax6000"] = catalog.identity
+    json_file.write_text(json.dumps(json_content, sort_keys=True) + "\n")
+    checksums = []
+    for output in sorted(bin_dir.iterdir()):
+        if output.is_file() and output.name not in {"sha256sums", "SHA256SUMS"}:
+            with output.open("rb") as stream:
+                checksums.append(
+                    hashlib.file_digest(stream, "sha256").hexdigest()
+                    + "  "
+                    + output.name
+                    + "\n"
+                )
+    for name in ("sha256sums", "SHA256SUMS"):
+        (bin_dir / name).write_text("".join(checksums))
     store = get_store()
     store.upload_dir(bin_dir, request_hash)
 
     if not isinstance(store, LocalStore):
         shutil.rmtree(bin_dir, ignore_errors=True)
 
-    json_content.update({"manifest": manifest})
+    json_content.update({"manifest": manifest, "ax6000": catalog.identity})
     json_content.update(json_content["profiles"][build_request.profile])
     json_content["id"] = build_request.profile
     json_content["bin_dir"] = request_hash
@@ -504,12 +532,45 @@ def _build(build_request: BuildRequest, job=None):
 
 
 def build(build_request: BuildRequest, job=None):
+    require(
+        get_catalog() is not None,
+        "Build requires an operator-promoted AX6000 catalog",
+    )
     try:
-        result = _build(build_request, job)
+        import fcntl
+
+        lock_path = getenv("ASU_GLOBAL_BUILD_LOCK", "/build-lock/.build.lock")
+        with open(lock_path, "r") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            from asu.cache_policy import prune_cache, discard_invalid_build_cache
+
+            engine = get_engine()
+            engine.reap_orphans()
+            prune_cache(settings.public_path)
+            catalog = get_catalog()
+            normalized = BuildRequest(
+                **validate_request(catalog, build_request.model_dump())
+            )
+            discard_invalid_build_cache(
+                settings.public_path, get_request_hash(normalized), catalog.identity
+            )
+        # The parent releases its short setup lock before starting PID1's lock
+        # holder. No image/package work runs until the unique ready token appears.
+        import tempfile
+
+        settings.public_path.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(
+            prefix=".asu-", dir=settings.public_path
+        ) as workspace:
+            result = _build(build_request, job, workspace=workspace, engine=engine)
+
     except Exception as exc:
         # Log all build errors, including internal server errors.
-        add_build_event("failures")
-        error_log.log_build_error(build_request, str(exc))
+        try:
+            add_build_event("failures")
+            error_log.log_build_error(build_request, str(exc))
+        except Exception:
+            log.warning("Could not persist build failure; original error retained")
         raise
     else:
         add_build_event("successes")

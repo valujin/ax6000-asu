@@ -17,14 +17,13 @@ requires-python = ">=3.13"
 dependencies = [
     "fastapi[standard]>=0.139.0",
     "pynacl>=1.6.2",
-    "podman>=5.8.0",
+    "docker==7.1.0",
     "redis>=7.4.0",
     "pydantic-settings>=2.14.2",
     "rq>=2.10.0",
     "uvicorn>=0.46.0",
     "fastapi-cache2>=0.2.2",
     "httpx>=0.28.1",
-    "podman-compose>=1.6.0",
     "boto3>=1.43.2",
 ]
 

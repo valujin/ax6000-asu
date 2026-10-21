@@ -63,11 +63,19 @@ def test_local_store_upload_dir():
         (build_dir / "image.bin").write_bytes(b"fw1")
         (build_dir / "profiles.json").write_text("{}")
 
-        store.upload_dir(build_dir, "abc123")
+        store.upload_dir(build_dir, "a" * 64)
 
-        store_dir = Path(tmpdir) / "store" / "abc123"
+        store_dir = Path(tmpdir) / "store" / ("a" * 64)
         assert (store_dir / "image.bin").read_bytes() == b"fw1"
         assert (store_dir / "profiles.json").read_text() == "{}"
+        assert not build_dir.exists()  # publication was one atomic rename
+        import pytest
+
+        build_dir.mkdir()
+        (build_dir / "image.bin").write_bytes(b"changed")
+        with pytest.raises(ValueError, match="immutable build differs"):
+            store.upload_dir(build_dir, "a" * 64)
+        assert (store_dir / "image.bin").read_bytes() == b"fw1"
 
 
 def test_local_store_exists():

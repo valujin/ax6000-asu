@@ -1,0 +1,145 @@
+{
+  "schema_version": 1,
+  "fixture_only": true,
+  "metadata_path": "/etc/asu-cohort.json",
+  "cohorts": {
+    "66": {
+      "server_url": "https://asu.ezon.by/66",
+      "native": {
+        "schema_version": 1,
+        "cohort": "66",
+        "seed": "1111111111111111111111111111111111111111111111111111111111111111",
+        "package_manager": "opkg"
+      },
+      "target": {
+        "schema_version": 1,
+        "cohort": "66",
+        "seed": "1111111111111111111111111111111111111111111111111111111111111111",
+        "build_id": "fixture-build-66",
+        "catalog_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "snapshot_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "kernel_version": "6.6.133~aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-r1",
+        "package_manager": "opkg"
+      },
+      "request": {
+        "version": "24.10-SNAPSHOT",
+        "target": "mediatek/filogic",
+        "profile": "xiaomi_redmi-router-ax6000-stock",
+        "filesystem": "squashfs",
+        "ax6000": {
+          "schema_version": 1,
+          "cohort": "66",
+          "seed": "1111111111111111111111111111111111111111111111111111111111111111",
+          "build_id": "fixture-build-66",
+          "catalog_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "snapshot_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "kernel_version": "6.6.133~aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-r1",
+          "package_manager": "opkg"
+        },
+        "packages": [
+          "busybox",
+          "luci-app-attendedsysupgrade"
+        ],
+        "installed_packages": [
+          "busybox",
+          "luci-app-attendedsysupgrade"
+        ],
+        "diff_packages": false,
+        "rootfs_size_mb": null,
+        "installed_package_manager": "opkg"
+      }
+    },
+    "612-recommended": {
+      "server_url": "https://asu.ezon.by/612/recommended",
+      "native": {
+        "schema_version": 1,
+        "cohort": "612-recommended",
+        "seed": "1111111111111111111111111111111111111111111111111111111111111111",
+        "package_manager": "apk"
+      },
+      "target": {
+        "schema_version": 1,
+        "cohort": "612-recommended",
+        "seed": "1111111111111111111111111111111111111111111111111111111111111111",
+        "build_id": "fixture-build-612-recommended",
+        "catalog_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "snapshot_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "kernel_version": "6.12.108~aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-r1",
+        "package_manager": "apk"
+      },
+      "request": {
+        "version": "25.12-SNAPSHOT",
+        "target": "mediatek/filogic",
+        "profile": "xiaomi_redmi-router-ax6000-stock",
+        "filesystem": "squashfs",
+        "ax6000": {
+          "schema_version": 1,
+          "cohort": "612-recommended",
+          "seed": "1111111111111111111111111111111111111111111111111111111111111111",
+          "build_id": "fixture-build-612-recommended",
+          "catalog_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "snapshot_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "kernel_version": "6.12.108~aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-r1",
+          "package_manager": "apk"
+        },
+        "packages": [
+          "busybox",
+          "luci-app-attendedsysupgrade"
+        ],
+        "installed_packages": [
+          "busybox",
+          "luci-app-attendedsysupgrade"
+        ],
+        "diff_packages": false,
+        "rootfs_size_mb": null,
+        "installed_package_manager": "apk"
+      }
+    },
+    "612-latest": {
+      "server_url": "https://asu.ezon.by/612/latest",
+      "native": {
+        "schema_version": 1,
+        "cohort": "612-latest",
+        "seed": "1111111111111111111111111111111111111111111111111111111111111111",
+        "package_manager": "apk"
+      },
+      "target": {
+        "schema_version": 1,
+        "cohort": "612-latest",
+        "seed": "1111111111111111111111111111111111111111111111111111111111111111",
+        "build_id": "fixture-build-612-latest",
+        "catalog_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "snapshot_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "kernel_version": "6.12.112~aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-r1",
+        "package_manager": "apk"
+      },
+      "request": {
+        "version": "25.12-SNAPSHOT",
+        "target": "mediatek/filogic",
+        "profile": "xiaomi_redmi-router-ax6000-stock",
+        "filesystem": "squashfs",
+        "ax6000": {
+          "schema_version": 1,
+          "cohort": "612-latest",
+          "seed": "1111111111111111111111111111111111111111111111111111111111111111",
+          "build_id": "fixture-build-612-latest",
+          "catalog_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "snapshot_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "kernel_version": "6.12.112~aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-r1",
+          "package_manager": "apk"
+        },
+        "packages": [
+          "busybox",
+          "luci-app-attendedsysupgrade"
+        ],
+        "installed_packages": [
+          "busybox",
+          "luci-app-attendedsysupgrade"
+        ],
+        "diff_packages": false,
+        "rootfs_size_mb": null,
+        "installed_package_manager": "apk"
+      }
+    }
+  }
+}

@@ -12,6 +12,10 @@ REPO_URL_PATTERN = r"^https?://\S+$"
 
 
 class BuildRequest(BaseModel):
+    installed_package_manager: str | None = None
+    installed_packages: list[str] = []
+    ax6000: dict | None = None
+
     distro: Annotated[
         str,
         Field(

@@ -1,0 +1,15 @@
+{
+  "ID": "c592b58c-bc7e-40a0-91b5-29d5b29387a1",
+  "CgroupDriver": "systemd",
+  "CgroupVersion": "2",
+  "SecurityOptions": [
+    "name=seccomp,profile=builtin",
+    "name=rootless",
+    "name=cgroupns"
+  ],
+  "MemoryLimit": true,
+  "SwapLimit": true,
+  "CpuCfsQuota": true,
+  "CPUSet": true,
+  "PidsLimit": true
+}

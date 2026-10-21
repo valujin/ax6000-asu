@@ -1,0 +1,12 @@
+.git
+.venv
+__pycache__
+*.pyc
+.env
+*.sec
+key-build*
+public
+store
+redis-data
+tests
+.ci-recipes

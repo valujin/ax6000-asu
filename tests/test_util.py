@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from podman import PodmanClient
+from asu.docker_engine import EngineError
 
 import asu.util
 from asu.repositories import is_repo_allowed
@@ -17,7 +17,7 @@ from asu.util import (
     get_container_version_tag,
     get_file_hash,
     get_packages_hash,
-    get_podman,
+    get_engine,
     get_request_hash,
     get_str_hash,
     is_post_kmod_split_build,
@@ -361,29 +361,23 @@ def test_check_package_errors():
     )
 
 
-def test_get_podman():
-    podman = get_podman()
-    assert isinstance(podman, PodmanClient)
+def test_get_engine_requires_explicit_dedicated_rootless_socket(monkeypatch):
+    monkeypatch.delenv("ASU_BUILD_ENGINE_URL", raising=False)
+    with pytest.raises(EngineError, match="Explicit rootless"):
+        get_engine()
 
 
 def test_run_cmd():
-    podman = get_podman()
-    podman.images.pull("ghcr.io/openwrt/imagebuilder:testtarget-testsubtarget-v1.2.3")
+    from unittest.mock import MagicMock
 
-    container = podman.containers.create(
-        "ghcr.io/openwrt/imagebuilder:testtarget-testsubtarget-v1.2.3",
-        command=["sleep", "1000"],
-        detach=True,
-    )
-    container.start()
-
-    returncode, stdout, stderr = run_cmd(
-        container,
-        ["make", "info"],
-    )
-
+    container = MagicMock()
+    container.exec_run.return_value = (0, (b"Current Target: mediatek/filogic", b""))
+    returncode, stdout, stderr = run_cmd(container, ["make", "info"])
     assert returncode == 0
-    assert "testtarget/testsubtarget" in stdout
+    assert "mediatek/filogic" in stdout
+    container.exec_run.assert_called_once_with(
+        ["make", "info"], demux=True, user="1000:1000"
+    )
 
 
 def test_run_cmd_rejects_tar_path_traversal(tmp_path, monkeypatch):

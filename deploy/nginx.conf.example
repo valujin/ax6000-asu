@@ -1,0 +1,33 @@
+# Add as a NEW origin vhost after catalog/runtime/HTTPS checks. Never replace
+# existing proxy configuration. Cloudflare DNS does not establish origin TLS.
+limit_req_zone $binary_remote_addr zone=ax6000_asu:1m rate=30r/m;
+server {
+    listen 443 ssl;
+    server_name asu.ezon.by;
+    # ssl_certificate and ssl_certificate_key: operator-provisioned origin TLS.
+    client_max_body_size 256k;
+    if ($request_method = OPTIONS) { return 204; }
+    add_header Access-Control-Allow-Origin "*" always;
+    add_header Access-Control-Allow-Methods "GET, HEAD, POST, OPTIONS" always;
+    add_header Access-Control-Allow-Headers "Content-Type" always;
+    add_header Cache-Control "no-store" always;
+    location /66/ {
+        limit_req zone=ax6000_asu burst=30 nodelay;
+        proxy_pass http://127.0.0.1:18066/;
+        proxy_redirect ~^(/.*)$ /66$1;
+        proxy_read_timeout 65s;
+    }
+    location /612/recommended/ {
+        limit_req zone=ax6000_asu burst=30 nodelay;
+        proxy_pass http://127.0.0.1:18108/;
+        proxy_redirect ~^(/.*)$ /612/recommended$1;
+        proxy_read_timeout 65s;
+    }
+    location /612/latest/ {
+        limit_req zone=ax6000_asu burst=30 nodelay;
+        proxy_pass http://127.0.0.1:18112/;
+        proxy_redirect ~^(/.*)$ /612/latest$1;
+        proxy_read_timeout 65s;
+    }
+    location / { return 404; }
+}

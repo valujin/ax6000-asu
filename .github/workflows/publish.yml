@@ -1,44 +1,123 @@
-name: Upload Docker Container
-permissions:
-  contents: read
+name: ASU service container smoke
 
 on:
   push:
-    branches:
-      - main
-  release:
-    types:
-      - created
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      publish_ghcr:
+        description: Publish this tested commit image to ghcr.io/valujin/ax6000-asu using a commit-addressed tag; deployment still requires its registry digest
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  ASU_CI_BUILDKIT: moby/buildkit@sha256:cec9f139f45e93c5c69c60f8b07cfad9f43f4ef6b6a6cd917527fea5ff2e3dea
 
 jobs:
-  deploy:
+  image:
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          fetch-depth: 0
+          persist-credentials: false
+      - name: Build the pinned runtime in a bounded disposable builder
+        run: |
+          read -r build_cpus build_quota < <(python3 - <<'PYCODE'
+          import os
+          allowed = sorted(os.sched_getaffinity(0))
+          count = max(1, min(2, len(allowed) // 2))
+          if count == 2 and allowed[1] == allowed[0] + 1:
+              print(f'{allowed[0]}-{allowed[1]}', count * 100000)
+          else:
+              print(allowed[0], 100000)
+          PYCODE
+          )
+          builder="asu-ci-$GITHUB_RUN_ID"
+          trap 'docker buildx rm "$builder" >/dev/null 2>&1 || true' EXIT
+          docker buildx create --name "$builder" --driver docker-container --use \
+            --driver-opt "image=$ASU_CI_BUILDKIT,memory=2g,memory-swap=2g,cpu-period=100000,cpu-quota=$build_quota,cpuset-cpus=$build_cpus" --bootstrap
+          build_id=$(docker ps --filter "name=buildx_buildkit_${builder}0" --format '{{.ID}}')
+          [[ -n "$build_id" ]]
+          docker inspect "$build_id" | BUILD_QUOTA="$build_quota" BUILD_CPUS="$build_cpus" python3 -c '
+          import json,os,sys
+          config=json.load(sys.stdin)[0]["HostConfig"]
+          assert config["Memory"]==config["MemorySwap"]==2*1024**3
+          assert config["CpuQuota"]==int(os.environ["BUILD_QUOTA"]) and config["CpuPeriod"]==100000
+          assert config["CpusetCpus"]==os.environ["BUILD_CPUS"]
+          '
+          docker buildx build --builder "$builder" --load --file Containerfile \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            --tag "ax6000-asu-ci:$GITHUB_SHA" .
+      - name: Runtime imports and compilation without a catalog or API activation
+        run: |
+          image="ax6000-asu-ci:$GITHUB_SHA"
+          [[ $(docker image inspect "$image" --format '{{.Config.User}}') == 1000:1000 ]]
+          docker run --rm --network none --user 1000:1000 --read-only \
+            --cap-drop ALL --security-opt no-new-privileges --pids-limit 64 \
+            --cpus 0.5 --memory 256m --memory-swap 256m --tmpfs /tmp:size=16m,mode=1777 \
+            "$image" python -c '
+          import pathlib,asu,fastapi,docker,redis
+          import ops.immutable_mirror,ops.promote,ops.builder_image
+          for path in pathlib.Path("/app/ops").glob("*.py"):
+              compile(path.read_bytes(),str(path),"exec")
+          print("Pinned runtime imports passed; no catalog, worker, API or Docker socket activated")
+          '
+      - name: Save exactly the tested image only for an explicit publication request
+        if: github.event_name == 'workflow_dispatch' && inputs.publish_ghcr && github.repository == 'valujin/ax6000-asu' && github.ref == 'refs/heads/main'
+        run: |
+          mkdir -p "$RUNNER_TEMP/tested-image"
+          docker save --output "$RUNNER_TEMP/tested-image/asu-image.tar" "ax6000-asu-ci:$GITHUB_SHA"
+          docker image inspect "ax6000-asu-ci:$GITHUB_SHA" --format '{{.Id}}' > "$RUNNER_TEMP/tested-image/image-id.txt"
+          (cd "$RUNNER_TEMP/tested-image" && sha256sum asu-image.tar > SHA256SUMS)
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: github.event_name == 'workflow_dispatch' && inputs.publish_ghcr && github.repository == 'valujin/ax6000-asu' && github.ref == 'refs/heads/main'
+        with:
+          name: tested-asu-image-${{ github.sha }}
+          path: ${{ runner.temp }}/tested-image
+          compression-level: 0
+          retention-days: 1
+          if-no-files-found: error
 
-      - name: Docker meta
-        id: meta
-        uses: docker/metadata-action@v5
+  publish:
+    needs: image
+    if: github.event_name == 'workflow_dispatch' && inputs.publish_ghcr && github.repository == 'valujin/ax6000-asu' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          images: openwrt/asu
-          tags: |
-            type=semver,pattern={{version}}
-            latest
-
-      - name: Login to DockerHub
-        if: github.repository_owner == 'openwrt'
-        uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKER_USERNAME }}
-          password: ${{ secrets.DOCKER_PASSWORD }}
-
-      - name: Build and push ASU to Docker Hub
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          file: Containerfile
-          push: ${{ github.repository_owner == 'openwrt' }}
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+          name: tested-asu-image-${{ github.sha }}
+          path: tested-image
+      - name: Verify and load the exact smoke-tested image
+        run: |
+          (cd tested-image && sha256sum --check --strict SHA256SUMS)
+          docker load --input tested-image/asu-image.tar
+          [[ $(docker image inspect "ax6000-asu-ci:$GITHUB_SHA" --format '{{.Id}}') == "$(cat tested-image/image-id.txt)" ]]
+          [[ $(docker image inspect "ax6000-asu-ci:$GITHUB_SHA" --format '{{index .Config.Labels "org.opencontainers.image.revision"}}') == "$GITHUB_SHA" ]]
+      - name: Publish only this commit image to the correct account
+        env:
+          GHCR_TOKEN: ${{ github.token }}
+        run: |
+          umask 077
+          auth="$RUNNER_TEMP/asu-ghcr-auth"
+          mkdir "$auth"
+          trap 'rm -f "$auth/config.json"' EXIT
+          printf '%s' "$GHCR_TOKEN" | docker --config "$auth" login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          unset GHCR_TOKEN
+          remote_image="ghcr.io/valujin/ax6000-asu:git-$GITHUB_SHA"
+          docker tag "ax6000-asu-ci:$GITHUB_SHA" "$remote_image"
+          docker --config "$auth" push "$remote_image" | tee "$RUNNER_TEMP/asu-ghcr-push.log"
+          printf 'Published `%s`. Deploy only its inspected immutable registry digest after operator promotion and real ImageBuilder acceptance.\n' "$remote_image" >> "$GITHUB_STEP_SUMMARY"

@@ -183,4 +183,4 @@ def test_api_repo_not_in_allow_list(client):
         },
     )
     assert response.status_code == 400
-    assert "not allowed" in response.json()["detail"]
+    assert response.json()["detail"] == "No operator-promoted AX6000 catalog configured"

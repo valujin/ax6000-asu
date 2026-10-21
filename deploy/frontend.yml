@@ -1,0 +1,56 @@
+# Merge with compose.yml using the SAME project name. Never edit NPM's compose,
+# containers or vhosts. Start only explicitly promoted cohorts/services.
+services:
+  frontend:
+    image: nginx@sha256:970364228b1e4f932abc22d321932816782cca8a20b85a77552a7cfe9acfb3b5
+    user: "101:101"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 64
+    mem_limit: 64m
+    cpus: 0.1
+    restart: unless-stopped
+    entrypoint: [nginx]
+    command: ["-g", "daemon off;", "-c", "/etc/nginx/nginx.conf"]
+    tmpfs: [/tmp:size=16m,mode=1777,uid=101,gid=101]
+    volumes:
+      - ./frontend.conf:/etc/nginx/nginx.conf:ro
+      - ${ASU_STATE_DIR:?Set dedicated promoted state directory}/immutable:/immutable:ro
+    networks:
+      api: {}
+      npm:
+        aliases: [ax6000-asu-front]
+    logging: {driver: local, options: {max-size: 2m, max-file: "2"}}
+
+  immutable_mirror:
+    profiles: [mirror]
+    image: ${ASU_SERVICE_IMAGE:?Set verified ASU service image digest}
+    user: "1000:1000"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 64
+    mem_limit: 512m
+    cpus: 0.25
+    restart: unless-stopped
+    command: ["uvicorn", "ops.immutable_mirror:create_from_env", "--factory", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]
+    environment:
+      AX6000_MIRROR_REGISTRY: /indexes/registry.json
+      AX6000_MIRROR_REGISTRY_SHA256: ${ASU_MIRROR_REGISTRY_SHA256:?Pin reviewed mirror registry bytes}
+      AX6000_MIRROR_APK: /tools/apk
+      AX6000_MIRROR_APK_SHA256: ${ASU_MIRROR_APK_SHA256:?Pin independently built host APK binary}
+      AX6000_MIRROR_CACHE: /cache
+    tmpfs: [/tmp:size=128m,mode=1777]
+    volumes:
+      - ${ASU_STATE_DIR}/mirror:/indexes:ro
+      - ${ASU_STATE_DIR}/mirror-cache:/cache:rw
+      - ${ASU_MIRROR_APK:?Provision independently built runtime-compatible host APK}:/tools/apk:ro
+    networks: [api, mirror_egress]
+    logging: {driver: local, options: {max-size: 2m, max-file: "2"}}
+
+networks:
+  npm:
+    external: true
+    name: nginx-proxy-manager_default
+  mirror_egress: {}

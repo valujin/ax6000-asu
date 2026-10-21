@@ -1,0 +1,97 @@
+# No catalog or container fixture is activated by this file. Set all required
+# immutable image/config values only after operator promotion and runtime tests.
+x-api: &api
+  image: ${ASU_SERVICE_IMAGE:?Set verified ASU service image digest}
+  user: "1000:1000"
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: [no-new-privileges:true]
+  pids_limit: 128
+  mem_limit: 384m
+  cpus: 0.25
+  restart: unless-stopped
+  command: ["uvicorn", "asu.main:app", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers", "--forwarded-allow-ips", "*"]
+  tmpfs: [/tmp:size=32m,mode=1777]
+  volumes:
+    - ${ASU_STATE_DIR:?Set dedicated state directory}/catalogs:/catalogs:ro
+    - ${ASU_STATE_DIR}/public:/public:ro
+  networks: [api]
+  depends_on: [redis]
+  logging: {driver: local, options: {max-size: 2m, max-file: "2"}}
+
+services:
+  api66:
+    <<: *api
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      PUBLIC_PATH: /public/66
+      ASU_AX6000_COHORT: "66"
+      ASU_AX6000_CATALOG: /catalogs/66.json
+      ASU_AX6000_CATALOG_SHA256: ${CATALOG_66_SHA256:?Promote 6.6 catalog first}
+    ports: ["127.0.0.1:18066:8000"]
+  api612recommended:
+    <<: *api
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      PUBLIC_PATH: /public/612-recommended
+      ASU_AX6000_COHORT: 612-recommended
+      ASU_AX6000_CATALOG: /catalogs/612-recommended.json
+      ASU_AX6000_CATALOG_SHA256: ${CATALOG_612_RECOMMENDED_SHA256:?Promote recommended catalog first}
+    ports: ["127.0.0.1:18108:8000"]
+  api612latest:
+    <<: *api
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      PUBLIC_PATH: /public/612-latest
+      ASU_AX6000_COHORT: 612-latest
+      ASU_AX6000_CATALOG: /catalogs/612-latest.json
+      ASU_AX6000_CATALOG_SHA256: ${CATALOG_612_LATEST_SHA256:?Promote latest catalog first}
+    ports: ["127.0.0.1:18112:8000"]
+  worker:
+    image: ${ASU_SERVICE_IMAGE:?Set verified ASU service image digest}
+    user: "${ASU_BUILD_UID:?Set dedicated build user UID}:${ASU_BUILD_GID:?Set dedicated build user GID}"
+    group_add: ["${ASU_BUILD_LOCK_GID:?Set shared build lock GID}"]
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 256
+    mem_limit: 1536m
+    cpus: 0.5
+    restart: unless-stopped
+    stop_grace_period: 25m
+    # RQ Worker forks a fresh job child; never use SimpleWorker or preload ASU.
+    command: ["python", "-m", "asu.worker"]
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      ASU_COHORT_CONFIG_DIR: /config/cohorts
+      ASU_BUILD_ENGINE_URL: unix:///run/ax6000-build/docker.sock
+      ASU_BUILD_ENGINE_ID: ${ASU_BUILD_ENGINE_ID:?Record dedicated rootless engine ID}
+      ASU_GLOBAL_BUILD_LOCK: /build-lock/.build.lock
+    volumes:
+      - ${ASU_STATE_DIR}/catalogs:/catalogs:ro
+      - ${ASU_STATE_DIR}/cohorts:/config/cohorts:ro
+      - ${ASU_STATE_DIR}/public:/public:rw
+      - ${ASU_ROOTLESS_SOCKET:?Use dedicated rootless socket}:/run/ax6000-build/docker.sock:rw
+      - /home/valuxin/dev/owrt/ax6000-packages-build/work/.build.lock:/build-lock/.build.lock:ro
+    tmpfs: [/tmp:size=64m,mode=1777]
+    networks: [api]
+    depends_on: [redis]
+    logging: {driver: local, options: {max-size: 2m, max-file: "2"}}
+  redis:
+    image: ${ASU_REDIS_IMAGE:?Set verified Redis image digest}
+    command: [redis-server, --appendonly, "yes", --maxmemory, 128mb, --maxmemory-policy, noeviction]
+    user: "1000:1000"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 64
+    mem_limit: 256m
+    cpus: 0.25
+    volumes: ["${ASU_STATE_DIR}/redis:/data:rw"]
+    networks: [api]
+    restart: unless-stopped
+    logging: {driver: local, options: {max-size: 2m, max-file: "2"}}
+
+networks:
+  api:
+    internal: true

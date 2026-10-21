@@ -31,10 +31,36 @@ class LocalStore:
             shutil.copy2(local_path, dest)
 
     def upload_dir(self, local_dir: Path, prefix: str) -> None:
-        for path in local_dir.rglob("*"):
-            if path.is_file():
-                key = f"{prefix}/{path.relative_to(local_dir)}"
-                self.upload_file(path, key)
+        import hashlib
+        import re
+
+        if not re.fullmatch("[0-9a-f]{64}", prefix):
+            raise ValueError("Invalid immutable build directory")
+
+        def inventory(root):
+            result = {}
+            for path in root.rglob("*"):
+                if path.is_symlink():
+                    raise ValueError("Symlink in built output")
+                if path.is_file():
+                    with path.open("rb") as stream:
+                        result[str(path.relative_to(root))] = hashlib.file_digest(
+                            stream, "sha256"
+                        ).hexdigest()
+            return result
+
+        source = inventory(local_dir)
+        dest = self.base / prefix
+        if dest.exists():
+            if dest.is_symlink() or inventory(dest) != source:
+                raise ValueError("Existing immutable build differs")
+            return
+        # Source is a private sibling on the same state filesystem. Atomic
+        # rename publishes only completely validated output, never partial files.
+        local_dir.rename(dest)
+        import os
+
+        os.utime(dest, None)
 
     def get_url(self, key: str) -> str:
         return f"/store/{key}"

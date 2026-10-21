@@ -1,3 +1,4 @@
+from asu.ax6000_policy import get_catalog
 from pathlib import Path
 from typing import Union
 
@@ -118,3 +119,28 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
+
+# Three API processes have independent settings. The worker imports these only
+# inside a freshly forked, cohort-selected job.
+_catalog = get_catalog()
+if _catalog:
+    _branch = (
+        _catalog.version.removesuffix("-SNAPSHOT").rsplit(".", 1)[0]
+        if not _catalog.version.endswith("-SNAPSHOT")
+        else _catalog.version.removesuffix("-SNAPSHOT")
+    )
+    settings.branches = {
+        _branch: {
+            "name": _branch,
+            "path": "releases/{version}",
+            "enabled": True,
+            "snapshot": False,
+            "package_changes": [],
+        }
+    }
+    settings.allow_defaults = False
+    settings.repository_allow_list = []
+    settings.server_stats = False
+    settings.store_backend = "local"
+    settings.max_pending_jobs = min(settings.max_pending_jobs, 4)
+    settings.job_timeout = "20m"

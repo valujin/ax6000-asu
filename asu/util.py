@@ -16,14 +16,17 @@ import nacl.signing
 from fastapi import FastAPI
 import httpx
 from httpx import Response
-from podman import PodmanClient
-from podman.domain.containers import Container
+from asu.docker_engine import DockerEngine
+from typing import Any
+
 from rq import Queue
 from rq.job import Job
 
 import redis
 from asu.build_request import BuildRequest
 from asu.config import settings
+
+Container = Any
 
 log: logging.Logger = logging.getLogger("rq.worker")
 log.propagate = False  # Suppress duplicate log messages.
@@ -181,6 +184,11 @@ def get_request_hash(build_request: BuildRequest) -> str:
     Returns:
         str: hash of `req`
     """
+    from asu.ax6000_policy import get_catalog, cache_hash
+
+    catalog = get_catalog()
+    if catalog:
+        return cache_hash(catalog, build_request.model_dump())
     return get_str_hash(
         "".join(
             [
@@ -285,18 +293,8 @@ def get_container_version_tag(input_version: str) -> str:
     return version
 
 
-def _find_podman_socket() -> str:
-    for path in ["./podman.sock", "/var/podman.sock"]:
-        if Path(path).exists():
-            return f"unix://{Path(path).resolve()}"
-    return "unix:///var/podman.sock"
-
-
-def get_podman() -> PodmanClient:
-    return PodmanClient(
-        base_url=_find_podman_socket(),
-        identity=settings.container_identity,
-    )
+def get_engine() -> DockerEngine:
+    return DockerEngine()
 
 
 def diff_packages(
@@ -322,7 +320,7 @@ def run_cmd(
     command: list[str],
     copy: list[str] | None = None,
 ) -> tuple[int, str, str]:
-    returncode, output = container.exec_run(command, demux=True, user="buildbot")
+    returncode, output = container.exec_run(command, demux=True, user="1000:1000")
 
     stdout: str = output[0].decode("utf-8") if output[0] else ""
     stderr: str = output[1].decode("utf-8") if output[1] else ""
@@ -365,12 +363,9 @@ def parse_manifest(manifest_content: str) -> dict[str, str]:
     Returns:
         dict: Dictionary of packages and versions
     """
-    if " - " in manifest_content:
-        separator = " - "  # OPKG format
-    else:
-        separator = " "  # APK format
+    from asu.manifest_policy import parse_manifest_text
 
-    return dict(map(lambda pv: pv.split(separator), manifest_content.splitlines()))
+    return parse_manifest_text(manifest_content)
 
 
 def check_manifest(
@@ -614,6 +609,13 @@ def reload_versions(app: FastAPI) -> bool:
             if in_supported_branch(version):
                 version_list.append(version)
 
+    from asu.ax6000_policy import get_catalog
+
+    catalog = get_catalog()
+    if catalog:
+        app.latest = [catalog.version]
+        app.versions = [catalog.version]
+        return True
     response = client_get(settings.upstream_url + "/.versions.json")
     if response.status_code != 200:
         log.info(f".versions.json: failed to download {response.status_code}")
@@ -659,6 +661,16 @@ def reload_targets(app: FastAPI, version: str) -> bool:
     Returns `True` if data has changed, `False` when cache was used.
     """
 
+    from asu.ax6000_policy import get_catalog
+
+    catalog = get_catalog()
+    if catalog:
+        app.targets[version] = (
+            {"mediatek/filogic": "aarch64_cortex-a53"}
+            if version == catalog.version
+            else {}
+        )
+        return True
     branch_data = get_branch(version)
     version_path = branch_data["path"].format(version=version)
     response = client_get(settings.upstream_url + f"/{version_path}/.targets.json")
@@ -679,6 +691,20 @@ def reload_profiles(app: FastAPI, version: str, target: str) -> bool:
     Returns `True` indicating that we have reloaded the profile.
     """
 
+    from asu.ax6000_policy import get_catalog
+
+    catalog = get_catalog()
+    if catalog:
+        app.profiles[version][target] = (
+            {
+                alias.replace(",", "_"): profile
+                for profile, data in catalog.data["profiles"].items()
+                for alias in data["supported_devices"] + [profile]
+            }
+            if version == catalog.version and target == "mediatek/filogic"
+            else {}
+        )
+        return True
     branch_data = get_branch(version)
     version_path = branch_data["path"].format(version=version)
     response = client_get(

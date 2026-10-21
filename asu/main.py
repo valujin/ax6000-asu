@@ -11,6 +11,7 @@ from fastapi.templating import Jinja2Templates
 
 from asu import __version__
 from asu.config import settings
+from asu.ax6000_policy import get_catalog
 from asu.routers import api, stats
 from asu.store import LocalStore, get_store
 from asu.util import (
@@ -29,6 +30,27 @@ logging.basicConfig(encoding="utf-8", level=settings.log_level)
 base_path = Path(__file__).resolve().parent
 
 app = FastAPI()
+
+
+@app.middleware("http")
+async def bounded_requests(request: Request, call_next):
+    # Proxy and app both enforce bounds. Refuse unbounded/chunked POST input
+    # before Pydantic buffers it. LuCI sends a finite JSON body.
+    if get_catalog() and request.method == "POST":
+        from fastapi.responses import JSONResponse
+
+        length = request.headers.get("content-length", "")
+        if not length.isdigit():
+            return JSONResponse(
+                {"detail": "Content-Length required", "status": 411}, status_code=411
+            )
+        if int(length) > 256 * 1024:
+            return JSONResponse(
+                {"detail": "Request body too large", "status": 413}, status_code=413
+            )
+    return await call_next(request)
+
+
 app.include_router(api.router, prefix="/api/v1")
 app.include_router(stats.router, prefix="/api/v1")
 
@@ -97,6 +119,14 @@ def stats_page(request: Request):
 
 @app.get("/json/v1/{path:path}/index.json")
 def json_v1_target_index(path: str) -> dict[str, Union[str, dict[str, str]]]:
+    catalog = get_catalog()
+    if catalog:
+        if path != f"releases/{catalog.version}/targets/mediatek/filogic":
+            raise HTTPException(status_code=404, detail="Unsupported catalog path")
+        return {
+            "architecture": catalog.data["firmware"]["architecture"],
+            "packages": catalog.data["packages"],
+        }
     base_path: str = f"{settings.upstream_url}/{path}"
     base_packages: dict[str, str] = parse_packages_file(f"{base_path}/packages")
     if is_post_kmod_split_build(path):
@@ -111,6 +141,14 @@ def json_v1_target_index(path: str) -> dict[str, Union[str, dict[str, str]]]:
 
 @app.get("/json/v1/{path:path}/{arch:path}-index.json")
 def json_v1_arch_index(path: str, arch: str):
+    catalog = get_catalog()
+    if catalog:
+        if (
+            path != f"releases/{catalog.version}/packages"
+            or arch != catalog.data["firmware"]["architecture"]
+        ):
+            raise HTTPException(status_code=404, detail="Unsupported catalog path")
+        return {"architecture": arch, "packages": catalog.data["packages"]}
     feed_url: str = f"{settings.upstream_url}/{path}/{arch}"
     feeds: list[str] = parse_feeds_conf(feed_url)
     packages: dict[str, str] = {}
@@ -121,6 +159,23 @@ def json_v1_arch_index(path: str, arch: str):
 
 @app.get("/json/v1/{path:path}/targets/{target:path}/{profile:path}.json")
 def json_v1_profile(path: str, target: str, profile: str):
+    catalog = get_catalog()
+    if catalog:
+        if (
+            path != f"releases/{catalog.version}"
+            or target != "mediatek/filogic"
+            or profile not in catalog.data["profiles"]
+        ):
+            raise HTTPException(status_code=404, detail="Unsupported catalog profile")
+        data = catalog.data
+        return {
+            **data["firmware"],
+            **data["profiles"][profile],
+            "id": profile,
+            "images": [],
+            "ax6000": catalog.identity,
+            "arch_packages": data["firmware"]["architecture"],
+        }
     metadata: dict = client_get(
         f"{settings.upstream_url}/{path}/targets/{target}/profiles.json"
     ).json()
@@ -194,6 +249,8 @@ def json_v1_overview():
         },
     }
 
+    if get_catalog():
+        overview["ax6000"] = get_catalog().identity
     return overview
 
 

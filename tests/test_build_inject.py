@@ -54,6 +54,15 @@ def test_make_tar_empty():
         assert tar.getmembers() == []
 
 
+def test_make_tar_preserves_promoted_installer_executable_mode():
+    data = _make_tar(
+        {"asu-files/usr/sbin/ax6000-install-feed": b"#!/bin/sh\n"},
+        {"asu-files/usr/sbin/ax6000-install-feed": 0o755},
+    )
+    with tarfile.open(fileobj=BytesIO(data)) as archive:
+        assert archive.getmember("asu-files/usr/sbin/ax6000-install-feed").mode == 0o755
+
+
 def test_inject_files_no_extras():
     """No keys, repos, or defaults — nothing should be injected."""
     container = MagicMock()

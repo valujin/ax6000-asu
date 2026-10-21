@@ -5,10 +5,14 @@ from fastapi import APIRouter, Header, Request
 from fastapi.responses import RedirectResponse, Response
 from rq.job import Job
 
-from asu.build import build
 from asu.build_request import BuildRequest
 from asu.config import settings
-from asu.repositories import is_repo_allowed
+from asu.cache_policy import published_cache_valid
+from asu.ax6000_policy import (
+    get_catalog,
+    validate_request as validate_policy,
+    PolicyError,
+)
 from asu.util import (
     add_timestamp,
     add_build_event,
@@ -16,9 +20,6 @@ from asu.util import (
     get_branch,
     get_queue,
     get_request_hash,
-    reload_profiles,
-    reload_targets,
-    reload_versions,
 )
 
 router = APIRouter()
@@ -37,6 +38,15 @@ def get_distros() -> list:
 def api_v1_revision(
     version: str, target: str, subtarget: str, response: Response, request: Request
 ):
+    catalog = get_catalog()
+    if catalog:
+        if version != catalog.version or target + "/" + subtarget != "mediatek/filogic":
+            response.status_code = 400
+            return {"detail": "Unsupported cohort target/version", "status": 400}
+        return {
+            "revision": catalog.data["firmware"]["version_code"],
+            "ax6000": catalog.identity,
+        }
     branch_data = get_branch(version)
     if "path" not in branch_data:
         response.status_code = 400
@@ -92,64 +102,17 @@ def validate_request(
 
     """
 
-    if build_request.defaults and not settings.allow_defaults:
-        return validation_failure("Handling `defaults` not enabled on server")
-
-    for url in build_request.repositories.values():
-        if not is_repo_allowed(url, settings.repository_allow_list):
-            return validation_failure(f"Repository not allowed: {url}")
-
-    if build_request.distro not in get_distros():
-        return validation_failure(f"Unsupported distro: {build_request.distro}")
-
-    branch = get_branch(build_request.version)["name"]
-
-    if branch not in settings.branches:
-        return validation_failure(f"Unsupported branch: {build_request.version}")
-
-    if build_request.version not in app.versions:
-        reload_versions(app)
-        if build_request.version not in app.versions:
-            return validation_failure(f"Unsupported version: {build_request.version}")
-
-    build_request.packages: list[str] = [
-        x.removeprefix("+")
-        for x in (build_request.packages_versions.keys() or build_request.packages)
-    ]
-
-    if build_request.target not in app.targets[build_request.version]:
-        reload_targets(app, build_request.version)
-        if build_request.target not in app.targets[build_request.version]:
-            return validation_failure(
-                f"Unsupported target: {build_request.target}. The requested "
-                "target was either dropped, is still being built or is not "
-                "supported by the selected version. Please check the forums or "
-                "try again later."
-            )
-
-    def valid_profile(profile: str, build_request: BuildRequest) -> bool:
-        profiles = app.profiles[build_request.version][build_request.target]
-        if profile in profiles:
-            return True
-        if len(profiles) == 1 and "generic" in profiles:
-            # Handles the x86, armsr and other generic variants.
-            build_request.profile = "generic"
-            return True
-        return False
-
-    if not valid_profile(build_request.profile, build_request):
-        reload_profiles(app, build_request.version, build_request.target)
-        if not valid_profile(build_request.profile, build_request):
-            return validation_failure(
-                f"Unsupported profile: {build_request.profile}. The requested "
-                "profile was either dropped or never existed. Please check the "
-                "forums for more information."
-            )
-
-    build_request.profile = app.profiles[build_request.version][build_request.target][
-        build_request.profile
-    ]
-    return ({}, None)
+    catalog = get_catalog()
+    if not catalog:
+        return validation_failure("No operator-promoted AX6000 catalog configured")
+    if catalog:
+        try:
+            normalized = validate_policy(catalog, build_request.model_dump())
+            for key, value in normalized.items():
+                setattr(build_request, key, value)
+            return ({}, None)
+        except PolicyError as error:
+            return validation_failure(str(error))
 
 
 def return_job_v1(job: Job) -> tuple[dict, int, dict]:
@@ -197,7 +160,11 @@ def return_job_v1(job: Job) -> tuple[dict, int, dict]:
 @router.head("/build/{request_hash}")
 @router.get("/build/{request_hash}")
 def api_v1_build_get(request: Request, request_hash: str, response: Response) -> dict:
-    job: Job = get_queue().fetch_job(request_hash)
+    queue = get_queue()
+    # A stale Job.delete can otherwise delete a replacement queued under the
+    # same hash. Fetch, validate and invalidate share POST's admission lock.
+    with queue.connection.lock("asu:global-admission", timeout=120, blocking_timeout=2):
+        job = fetch_valid_job(queue, request_hash)
     if not job:
         response.status_code = 404
         return {
@@ -213,6 +180,29 @@ def api_v1_build_get(request: Request, request_hash: str, response: Response) ->
     return content
 
 
+def fetch_valid_job(queue, request_hash):
+    """Caller must hold global admission lock; never act on a stale Job."""
+    job: Job = queue.fetch_job(request_hash)
+    catalog = get_catalog()
+    if (
+        job
+        and catalog
+        and (
+            job.kwargs.get("cohort") != catalog.data["cohort"]
+            or job.kwargs.get("catalog_sha256") != catalog.sha256
+        )
+    ):
+        job = None
+    if (
+        job
+        and job.is_finished
+        and not published_cache_valid(settings.public_path, job.return_value())
+    ):
+        job.delete()
+        job = None
+    return job
+
+
 @router.post("/build")
 def api_v1_build_post(
     build_request: BuildRequest,
@@ -225,8 +215,13 @@ def api_v1_build_post(
 
     add_build_event("requests")
 
+    # Validate every request before cache lookup, including cache hits.
+    catalog = get_catalog()
+    content, status = validate_request(request.app, build_request)
+    if content:
+        response.status_code = status
+        return content
     request_hash: str = get_request_hash(build_request)
-    job: Job = get_queue().fetch_job(request_hash)
     status: int = 200
     if build_request.defaults:
         result_ttl = settings.build_defaults_ttl
@@ -248,33 +243,35 @@ def api_v1_build_post(
         {"stats": "clients", "client": client},
     )
 
-    if job is None:
-        add_build_event("cache-misses")
+    # Serialize reads, invalidation and admission across all API processes.
+    # The separate filesystem flock serializes actual heavy execution.
+    queue = get_queue()
+    with queue.connection.lock("asu:global-admission", timeout=120, blocking_timeout=2):
+        job = fetch_valid_job(queue, request_hash)
+        if job is None:
+            job_queue_length = len(queue)
+            if job_queue_length >= settings.max_pending_jobs:
+                response.status_code = 529
+                return {
+                    "status": 529,
+                    "title": "Server overloaded",
+                    "detail": "Global build queue is full",
+                }
+            add_build_event("cache-misses")
+            job = queue.enqueue(
+                "asu.jobs.run",
+                kwargs={
+                    "cohort": catalog.data["cohort"],
+                    "catalog_sha256": catalog.sha256,
+                    "request": build_request.model_dump(),
+                },
+                job_id=request_hash,
+                result_ttl=result_ttl,
+                failure_ttl=failure_ttl,
+                job_timeout=settings.job_timeout,
+            )
 
-        content, status = validate_request(request.app, build_request)
-        if content:
-            response.status_code = status
-            return content
-
-        job_queue_length = len(get_queue())
-        if job_queue_length > settings.max_pending_jobs:
-            response.status_code = 529
-            return {
-                "status": 529,  # "Site is overloaded"
-                "title": "Server overloaded",
-                "detail": f"server overload, queue contains too many build requests: {job_queue_length}",
-            }
-
-        job = get_queue().enqueue(
-            build,
-            build_request,
-            job_id=request_hash,
-            result_ttl=result_ttl,
-            failure_ttl=failure_ttl,
-            job_timeout=settings.job_timeout,
-        )
-    else:
-        if job.is_finished:
+        elif job.is_finished:
             add_build_event("cache-hits")
 
     content, status, headers = return_job_v1(job)

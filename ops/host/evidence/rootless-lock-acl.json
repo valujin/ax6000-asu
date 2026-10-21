@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "time_utc": "2026-10-21T10:44:05.653997+00:00",
+  "path": "/home/valuxin/dev/owrt/ax6000-packages-build/work/.build.lock",
+  "inode": 8156582,
+  "mapped_builder_uid": 197607,
+  "container_uid": 1000,
+  "subuid": [
+    "ax6000-asu-build",
+    "196608",
+    "65536"
+  ],
+  "before": "user::rw-\ngroup::rw-\nother::---\n",
+  "after": "user::rw-\nuser:197607:r--\ngroup::rw-\nmask::rw-\nother::---\n",
+  "purpose": "Read-only flock descriptor held by ASU container PID1 independently of worker"
+}
