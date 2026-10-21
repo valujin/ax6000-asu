@@ -165,6 +165,62 @@ class SmokeRunnerTests(unittest.TestCase):
             smoke.validate_manifest(self.defaults | {'libustream-openssl': '1'}, self.defaults, controls,
                                     self.profile['firmware']['kernel_version'], 'opkg', excluded=['libustream-openssl'])
 
+    def test_actual_apk_preflight_filters_only_one_exact_native_verification_line(self):
+        original = (Path(__file__).parent / 'fixtures/native-apk-preflight.txt').read_bytes()
+        fixture = self.root / 'manifest.txt'
+        fixture.write_bytes(original)
+        # The actual native verifier accepts only one unique `name - version`
+        # row per package. Keep that parser boundary after stdout filtering.
+        def native_manifest(path):
+            result = {}
+            for line in Path(path).read_text().splitlines():
+                name, version = line.split(' - ')
+                if name in result or not name or not version:
+                    raise ValueError('Malformed/duplicate native manifest')
+                result[name] = version
+            if not result:
+                raise ValueError('Empty native manifest')
+            return result
+        verifier = SimpleNamespace(device_manifest=native_manifest)
+        expected = dict(line.split(' - ') for line in original.decode().splitlines()[1:])
+        with self.assertRaises(ValueError):
+            native_manifest(fixture)
+        self.assertTrue(hasattr(smoke, 'make_manifest_stdout'), 'Native make stdout needs its exact APK status filter')
+        actual = smoke.make_manifest_stdout(verifier, fixture, 'apk')
+        self.assertEqual(actual, expected)
+        self.assertEqual(len(actual), 293)
+        self.assertEqual(fixture.read_bytes(), original)
+        self.assertEqual(smoke.make_manifest_stdout(verifier, fixture, 'apk'), expected)
+        bare = self.root / 'bare' / 'manifest.txt'
+        bare.parent.mkdir()
+        bare.write_text('\n'.join(original.decode().splitlines()[1:]) + '\n')
+        self.assertEqual(smoke.make_manifest_stdout(verifier, bare, 'apk'), expected)
+        bare_opkg = self.root / 'bare-opkg' / 'manifest.txt'
+        bare_opkg.parent.mkdir()
+        bare_opkg.write_bytes(bare.read_bytes())
+        self.assertEqual(smoke.make_manifest_stdout(verifier, bare_opkg, 'opkg'), expected)
+        output = original.decode()
+        invalid = [output.replace('/builder/packages/packages.adb', '/builder/packages/foreign.adb'),
+                   output.replace(': OK', ': OK extra'), output.replace(': OK', ': BAD signature'),
+                   '/builder/packages/packages.adb: OK\n' + output,
+                   '/builder/packages/packages.adb: OK\n']
+        for index, content in enumerate(invalid):
+            path = self.root / ('invalid-' + str(index)) / 'manifest.txt'
+            path.parent.mkdir()
+            path.write_text(content)
+            with self.subTest(index=index), self.assertRaises(ValueError):
+                smoke.make_manifest_stdout(verifier, path, 'apk')
+        opkg = self.root / 'opkg' / 'manifest.txt'
+        opkg.parent.mkdir()
+        opkg.write_bytes(original)
+        with self.assertRaises(ValueError):
+            smoke.make_manifest_stdout(verifier, opkg, 'opkg')
+        with self.assertRaises(ValueError):
+            smoke.make_manifest_stdout(verifier, fixture.with_name('manifest.packages.txt'), 'apk')
+        fixture.with_name('manifest.packages.txt').write_text('corrupt retained output')
+        with self.assertRaises(ValueError):
+            smoke.make_manifest_stdout(verifier, fixture, 'apk')
+
     def test_run_layout_uses_successful_info_for_manifest_and_image_selection(self):
         observed = []
         lock = self.root / "fixture-build.lock"

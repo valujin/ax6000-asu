@@ -49,6 +49,31 @@ builder = module(HERE / 'builder_image.py', 'smoke_builder_image')
 promotion = module(HERE / 'promote.py', 'smoke_promotion')
 
 
+def native_preflight_output(content, manager):
+    """Silent native make still emits APK's verified-bank success message."""
+    if manager != "apk":
+        return content
+    expected = "/builder/packages/packages.adb: OK"
+    lines = content.splitlines()
+    require(lines.count(expected) <= 1, "Duplicate native APK verification result")
+    return "\n".join(line for line in lines if line != expected)
+
+
+def make_manifest_stdout(verifier, path, manager):
+    """Normalize only retained make stdout, then invoke the strict file parser."""
+    path = promotion.regular(path, 4 * MIB)
+    require(path.name == 'manifest.txt', 'Only make-manifest stdout may be normalized')
+    payload = native_preflight_output(path.read_text(), manager).encode()
+    normalized = path.with_name('manifest.packages.txt')
+    if normalized.exists() or normalized.is_symlink():
+        require(promotion.regular(normalized, 4 * MIB).read_bytes() == payload,
+                'Retained normalized make-manifest output changed')
+    else:
+        with normalized.open('xb') as stream:
+            stream.write(payload)
+    return verifier.device_manifest(normalized)
+
+
 def identity(profile):
     firmware = profile['firmware']
     result = {'build_id': profile['build_id'], 'source_commit': firmware['commit'],
@@ -487,7 +512,7 @@ def inspect_artifacts(layout, directory, context, receipt_parent, selection):
     manifests = list(artifacts.glob('*.manifest'))
     require(len(manifests) == 1, 'Expected exactly one actual emitted image manifest')
     actual = verifier.device_manifest(manifests[0])
-    preflight = verifier.device_manifest(directory / 'manifest.txt')
+    preflight = make_manifest_stdout(verifier, directory / 'manifest.txt', profile.get('package_manager', 'opkg'))
     validate_manifest(actual, context['defaults'][layout], context['controls'], profile['firmware']['kernel_version'],
                       profile.get('package_manager', 'opkg'), excluded=selection['excluded_packages'])
     require(actual == preflight, 'Actual emitted image manifest differs from preflight')
@@ -574,7 +599,7 @@ def run_layout(layout, output, args, context, lock_stat):
                                                  for op in ('manifest', 'image')}}
                 (directory / 'package-selection.json').write_text(json.dumps(selection_record, indent=2, sort_keys=True) + '\n')
             if operation == 'manifest':
-                preflight = verifier.device_manifest(directory / 'manifest.txt')
+                preflight = make_manifest_stdout(verifier, directory / 'manifest.txt', context['profile'].get('package_manager', 'opkg'))
                 validate_manifest(preflight, context['defaults'][layout], context['controls'], context['profile']['firmware']['kernel_version'],
                                   context['profile'].get('package_manager', 'opkg'), excluded=selection['excluded_packages'])
         # Stop only this owned container after all real make operations. The
