@@ -5,6 +5,7 @@ from pydantic import BaseModel, Field
 from asu.config import settings
 
 STRING_PATTERN = r"^[\w.,-]*$"
+REVISION_PATTERN = r"^[\w+.,-]*$"
 TARGET_PATTERN = r"^[\w]*/[\w]*$"
 PKG_VERSION_PATTERN = r"^[\w+.,~-]*$"
 REPO_NAME_PATTERN = r"^[\w.-]+$"
@@ -47,7 +48,7 @@ class BuildRequest(BaseModel):
                 resulting firmware is a different revision, the build results
                 in an error.
             """.strip(),
-            pattern=STRING_PATTERN,
+            pattern=REVISION_PATTERN,
         ),
     ] = ""
     target: Annotated[

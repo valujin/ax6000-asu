@@ -15,7 +15,9 @@ class HTTPContractTests(unittest.TestCase):
     def test_revision_overview_queue_and_cross_cohort_guards(self):
         with tempfile.TemporaryDirectory() as tmp:
             p = Path(tmp) / "catalog.json"
-            data = json.dumps(fixture()).encode()
+            catalog = fixture()
+            catalog["firmware"]["version_code"] = "r0+33648-ec9ef10efc"
+            data = json.dumps(catalog).encode()
             p.write_bytes(data)
             env = {
                 **os.environ,
@@ -68,9 +70,13 @@ with TestClient(app) as c:
     assert index.status_code==200 and 'kernel' in index.json()['packages']
     assert c.get('/json/v1/releases/24.10/targets/mediatek/filogic/index.json').status_code==404
     assert c.get('/api/v1/revision/24.10-SNAPSHOT/mediatek/filogic').status_code==400
-    request={'version':'25.12-SNAPSHOT','target':'mediatek/filogic',
+    request={'version':'25.12-SNAPSHOT','version_code':'r0+33648-ec9ef10efc','target':'mediatek/filogic',
         'profile':'xiaomi_redmi-router-ax6000-stock','packages':['busybox'],
         'installed_packages':['busybox'],'installed_package_manager':'apk','ax6000':target,'diff_packages':False}
+    wrong={**request,'ax6000':{**target,'cohort':'612-latest'}}
+    rejected=c.post('/api/v1/build',json=wrong)
+    assert rejected.status_code==400,rejected.text
+    assert q.job is None and q.enqueued is None
     result=c.post('/api/v1/build',json=request)
     assert result.status_code==202,result.text
     assert q.enqueued[0]==('asu.jobs.run',)
