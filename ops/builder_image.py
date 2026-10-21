@@ -31,6 +31,19 @@ MAX_EXPANDED = 24 * 1024**3
 MAX_MEMBERS = 200000
 KEY_MARKERS = re.compile(rb'-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----|openssh-key-v1\x00|untrusted comment:[^\n]{0,160}(?:secret|private) key', re.I)
 USIGN_SECRET = re.compile(rb'(?<![A-Za-z0-9+/])[A-Za-z0-9+/]{139}=(?![A-Za-z0-9+/=])')
+PUBLIC_VENDOR_TOOL = {
+    'path': 'staging_dir/host/bin/.dlink-sge-image.bin',
+    'sha256': 'e1cc6b5b30c14f31017b4d2c460fe5642be18a6a36f50fb9d690711920ea1dbf',
+    'size': 1857584,
+    'classification': 'public-upstream-vendor-factory-keys',
+    'source_repository': 'https://git.openwrt.org/project/firmware-utils.git',
+    'source_commit': '5d1446bf57d6490573dc71f10c05e83b36d44374',
+    'source_header_path': 'src/dlink-sge-image.h',
+    'source_header_sha256': 'b792d24ab3bae14c39defc6e949caed42b2079cd1209266fe8460f87493869f6',
+    'source_implementation_path': 'src/dlink-sge-image.c',
+    'source_implementation_sha256': '639dcee26d80c4dd1b9a60799b45a29a3b2cff081fb4f31b5a4ad608384cf112',
+    'public_key_blocks': 5,
+}
 
 
 def require(value, message):
@@ -77,6 +90,26 @@ def load_pinned(path, expected_sha):
     return json.loads(path.read_text(), object_pairs_hook=unique_object)
 
 
+def reviewed_vendor_tools(proof):
+    """No generic marker bypass: one fixed, separately approved upstream blob."""
+    entries = proof.get('reviewed_public_vendor_tools', [])
+    require(isinstance(entries, list) and len(entries) <= 1, 'Invalid reviewed public vendor-tool inventory')
+    require(not entries or (isinstance(entries[0], dict) and entries[0] == PUBLIC_VENDOR_TOOL),
+            'Unrecognized public vendor-tool exception or source provenance')
+    return {entry['path']: entry for entry in entries}
+
+
+def verify_reviewed_vendor_tool(path, approved):
+    require(approved == PUBLIC_VENDOR_TOOL, 'Unrecognized reviewed vendor-tool bytes/provenance')
+    path = regular(path, PUBLIC_VENDOR_TOOL['size'])
+    require(path.stat().st_size == approved['size'] and sha256(path) == approved['sha256'],
+            'Reviewed public vendor-tool bytes differ')
+    with path.open('rb') as stream:
+        header = stream.read(20)
+    require(header[:7] == b'\x7fELF\x02\x01\x01' and header[18:20] == b'\x3e\x00',
+            'Reviewed public vendor tool is not the expected x86-64 ELF')
+
+
 def validate_inputs(archive, archive_sha, proof_path, proof_sha, profile_path, public_key_path):
     archive = regular(archive)
     require(SHA.fullmatch(archive_sha or '') is not None and sha256(archive) == archive_sha,
@@ -87,6 +120,9 @@ def validate_inputs(archive, archive_sha, proof_path, proof_sha, profile_path, p
     required_true = ('approved', 'source_context_verified', 'native_bank_verified',
                      'signatures_verified', 'private_keys_absent')
     require(all(proof.get(key) is True for key in required_true), 'ImageBuilder has incomplete independent verification')
+    # Legacy private_keys_absent attests absence of native/production/unapproved
+    # signing secrets. Explicit public upstream factory-key tools are recorded.
+    reviewed_vendor_tools(proof)
     require(proof.get('archive_sha256') == archive_sha and proof.get('archive_size') == archive.stat().st_size,
             'Verification receipt names a different archive')
     for field in ('profile_sha256', 'public_key_sha256', 'attestation_sha256', 'verification_result_sha256'):
@@ -188,6 +224,8 @@ def unpack(archive, destination):
 def scan_tree(tree, proof):
     tree = Path(tree)
     files, total = 0, 0
+    approved_vendor_tools = reviewed_vendor_tools(proof)
+    seen_vendor_tools = set()
     for path in tree.rglob('*'):
         relative = path.relative_to(tree)
         lower = path.name.lower()
@@ -202,11 +240,16 @@ def scan_tree(tree, proof):
             continue
         files += 1
         total += path.stat().st_size
+        if relative.as_posix() in approved_vendor_tools:
+            verify_reviewed_vendor_tool(path, approved_vendor_tools[relative.as_posix()])
+            seen_vendor_tools.add(relative.as_posix())
+            continue
         with path.open('rb') as stream:
             tail = b''
             while chunk := stream.read(1024**2):
                 require(not private_key_content(tail + chunk), 'Private key marker in ImageBuilder: ' + str(relative))
                 tail = chunk[-512:]
+    require(seen_vendor_tools == set(approved_vendor_tools), 'Approved public vendor tool is missing or not a regular file')
     attestation_path = regular(tree / 'ax6000-imagebuilder.json', 8 * 1024**2)
     require(sha256(attestation_path) == proof['attestation_sha256'], 'ImageBuilder attestation digest mismatch')
     metadata = json.loads(attestation_path.read_text(), object_pairs_hook=unique_object)
@@ -234,7 +277,8 @@ def scan_tree(tree, proof):
     manager_file = 'repositories.conf' if proof['package_manager'] == 'opkg' else 'repositories'
     require((tree / manager_file).is_file(), 'ImageBuilder package manager differs')
     return {'regular_files': files, 'regular_bytes': total, 'context_files': len(contexts),
-            'private_key_scan': 'prohibited names and markers; independent pinned approval covers complete archive'}
+            'private_key_scan': 'native/production/unapproved signing secrets rejected; exact approved public vendor factory tool recorded separately',
+            'reviewed_public_vendor_tools': list(approved_vendor_tools.values())}
 
 
 def labels(proof, proof_sha):
@@ -281,6 +325,88 @@ def validate_image(base, image, expected_labels):
     require(not config.get('Volumes') and not config.get('OnBuild'), 'Unexpected image volumes/build hooks')
     require(all(config.get('Labels', {}).get(key) == value for key, value in expected_labels.items()), 'Image labels differ from verified inputs')
     require(re.fullmatch(r'sha256:[0-9a-f]{64}', image.get('Id', '')) is not None, 'Invalid image identity')
+
+
+def saved_image_identity(archive, built_image_id, expected_layers):
+    """Bind classic/config and containerd/manifest IDs to the exact saved bytes.
+
+    Only our single-image uncompressed Docker-save/OCI format is accepted. All
+    blob hashes are checked, including classic history metadata compatibility
+    blobs. No extraction, daemon call, or supplied executable is involved.
+    """
+    require(re.fullmatch(r'sha256:[0-9a-f]{64}', built_image_id or '') is not None, 'Invalid built config identity')
+    require(isinstance(expected_layers, list) and expected_layers
+            and all(re.fullmatch(r'sha256:[0-9a-f]{64}', value) for value in expected_layers), 'Invalid expected image layers')
+    with tarfile.open(regular(archive), 'r:') as tar:
+        members, total = {}, 0
+        for entry in tar:
+            name = entry.name.rstrip('/')
+            require(name not in members and len(members) < 64 and not entry.pax_headers and entry.sparse is None,
+                    'Duplicate or unsupported saved-image member')
+            require(entry.name == name or (entry.isdir() and entry.name == name + '/'), 'Noncanonical saved-image path')
+            require((entry.isdir() and name in ('blobs', 'blobs/sha256') and entry.size == 0)
+                    or (entry.isfile() and (name in ('index.json', 'manifest.json', 'oci-layout')
+                        or re.fullmatch(r'blobs/sha256/[0-9a-f]{64}', name))), 'Unsafe saved-image member')
+            members[name] = entry
+            total += entry.size
+            require(total <= MAX_ARCHIVE, 'Saved image expands beyond bound')
+            if entry.isfile() and name.startswith('blobs/'):
+                with tar.extractfile(entry) as stream:
+                    actual = hashlib.file_digest(stream, 'sha256').hexdigest()
+                require(actual == name.rsplit('/', 1)[1], 'Saved-image blob content digest differs')
+
+        def read_json(name):
+            require(name in members and members[name].isfile() and members[name].size <= 1024**2,
+                    'Missing or oversized saved-image metadata: ' + name)
+            with tar.extractfile(members[name]) as stream:
+                return json.loads(stream.read(), object_pairs_hook=unique_object)
+
+        def blob(descriptor, media_type):
+            require(isinstance(descriptor, dict) and descriptor.get('mediaType') == media_type
+                    and re.fullmatch(r'sha256:[0-9a-f]{64}', descriptor.get('digest', '')),
+                    'Invalid saved-image descriptor')
+            name = 'blobs/sha256/' + descriptor['digest'].split(':', 1)[1]
+            require(name in members and members[name].isfile() and type(descriptor.get('size')) is int
+                    and descriptor['size'] == members[name].size, 'Saved-image descriptor size/content differs')
+            return name
+
+        require(read_json('oci-layout') == {'imageLayoutVersion': '1.0.0'}, 'Unsupported saved-image OCI layout')
+        index = read_json('index.json')
+        require(index.get('schemaVersion') == 2 and index.get('mediaType') == 'application/vnd.oci.image.index.v1+json'
+                and isinstance(index.get('manifests'), list) and len(index['manifests']) == 1,
+                'Saved image requires exactly one OCI manifest')
+        descriptor = index['manifests'][0]
+        manifest_name = blob(descriptor, 'application/vnd.oci.image.manifest.v1+json')
+        manifest = read_json(manifest_name)
+        require(manifest.get('schemaVersion') == 2 and manifest.get('mediaType') == 'application/vnd.oci.image.manifest.v1+json'
+                and not manifest.get('subject') and not manifest.get('artifactType'), 'Unsupported saved-image manifest')
+        config_name = blob(manifest.get('config'), 'application/vnd.oci.image.config.v1+json')
+        require(manifest['config']['digest'] == built_image_id, 'Saved OCI config differs from the constructed image')
+        config = read_json(config_name)
+        require(config.get('architecture') == 'amd64' and config.get('os') == 'linux'
+                and config.get('rootfs') == {'type': 'layers', 'diff_ids': expected_layers}, 'Saved image config/layers differ')
+        layers = manifest.get('layers')
+        require(isinstance(layers, list) and len(layers) == len(expected_layers), 'Saved OCI layer count differs')
+        layer_names = []
+        for layer, expected in zip(layers, expected_layers, strict=True):
+            layer_names.append(blob(layer, 'application/vnd.oci.image.layer.v1.tar'))
+            require(layer['digest'] == expected, 'Saved OCI layer digest differs from constructed image')
+        classic = read_json('manifest.json')
+        require(isinstance(classic, list) and len(classic) == 1 and isinstance(classic[0], dict)
+                and classic[0].get('Config') == config_name and classic[0].get('Layers') == layer_names
+                and classic[0].get('RepoTags') in (None, []), 'Saved Docker manifest differs from single untagged OCI image')
+        return {'load_format': 'docker-save-oci-single-manifest', 'config_id': built_image_id,
+                'oci_manifest_id': descriptor['digest'], 'oci_manifest_sha256': descriptor['digest'].split(':', 1)[1]}
+
+
+def loaded_image_id(load_stdout, saved):
+    require(isinstance(load_stdout, str) and len(load_stdout) <= 65536, 'Invalid image-load output')
+    lines = [line for line in load_stdout.splitlines() if line]
+    require(len(lines) == 1, 'Image load did not report one clean successful image; inspect retained load output')
+    match = re.fullmatch(r'Loaded image ID: (sha256:[0-9a-f]{64})', lines[0])
+    require(match and match[1] in (saved['config_id'], saved['oci_manifest_id']),
+            'Loaded image identity is not bound to the verified saved config/manifest')
+    return match[1]
 
 
 # Guard occurs inside every client container, immediately before its requested API call.
@@ -349,23 +475,33 @@ def build_load(tree, proof, proof_sha, work):
     docker(['image', 'save', '--output', str(image_tar), image_id])
     regular(image_tar)
     image_tar.chmod(0o444)  # Exact file bind bypasses the mode-0700 staging directory.
-    rootless_client(['image', 'load', '--input', '/assets/image.tar'], image_tar)
-    loaded = json.loads(rootless_client(['image', 'inspect', image_id]))[0]
+    saved = saved_image_identity(image_tar, image_id, image['RootFS']['Layers'])
+    try:
+        load_stdout = rootless_client(['image', 'load', '--input', '/assets/image.tar'], image_tar)
+    except subprocess.CalledProcessError as error:
+        (work / 'load.stdout').write_text(error.stdout or '')
+        (work / 'load.stderr').write_text(error.stderr or '')
+        raise
+    (work / 'load.stdout').write_text(load_stdout)
+    actual_image_id = loaded_image_id(load_stdout, saved)
+    loaded = json.loads(rootless_client(['image', 'inspect', actual_image_id]))[0]
     validate_image(base, loaded, labels(proof, proof_sha))
-    require(loaded['Id'] == image_id, 'Rootless loaded image ID differs')
-    rootless_probe = rootless_client(runtime_probe_command(image_id))
+    require(loaded['Id'] == actual_image_id, 'Rootless loaded image ID differs')
+    rootless_probe = rootless_client(runtime_probe_command(actual_image_id))
     require(proof['attestation_sha256'] in rootless_probe, 'Loaded image attestation differs')
     after = docker(['ps', '--quiet', '--no-trunc'], capture_output=True, text=True).stdout.splitlines()
     require(sorted(before) == sorted(after), 'Production running-container set changed; inspect before promotion')
     receipt = {'schema_version': 1, 'kind': 'ax6000-imagebuilder-image-load',
-               'image_id': image_id, 'base_image_id': BASE_IMAGE, 'base_layers': base['RootFS']['Layers'],
+               'image_id': actual_image_id, 'built_image_id': image_id, **saved, 'load_stdout': load_stdout,
+               'base_image_id': BASE_IMAGE, 'base_layers': base['RootFS']['Layers'],
                'image_layers': loaded['RootFS']['Layers'], 'archive_sha256': proof['archive_sha256'],
                'approval_receipt_sha256': proof_sha, 'attestation_sha256': proof['attestation_sha256'],
                'cohort': proof['cohort'], 'build_id': proof['build_id'], 'source_commit': proof['source_commit'],
                'loaded_engine_id': ROOTLESS_ENGINE, 'loaded_socket': ROOTLESS_SOCKET,
                'image_tar_sha256': sha256(image_tar), 'labels': labels(proof, proof_sha),
                'uid': 1000, 'gid': 1000, 'flock_timeout_available': True,
-               'private_key_check': 'pinned independent approval plus archive names/markers scan',
+               'private_key_check': 'pinned absence of native/production/unapproved signing secrets plus names/markers scan; exact public vendor exception recorded separately',
+               'reviewed_public_vendor_tools': list(reviewed_vendor_tools(proof).values()),
                'native_make_executed': False, 'catalog_promoted': False}
     (work / 'load-receipt.json').write_text(json.dumps(receipt, indent=2, sort_keys=True) + '\n')
     return receipt

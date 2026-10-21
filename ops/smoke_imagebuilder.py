@@ -60,6 +60,30 @@ def record(path, directory):
     return {'path': name, 'size': path.stat().st_size, 'sha256': builder.sha256(path)}
 
 
+def native_source_file(recorded, prefix, source, checksum, *, required_relative=None, executable=False):
+    """Map a reviewed proof namespace into the actual source without aliases."""
+    require(isinstance(recorded, str) and isinstance(prefix, str), 'Native source paths must be strings')
+    for value in (recorded, prefix, str(source)):
+        path = PurePosixPath(value)
+        require(path.is_absolute() and value != '/' and not value.startswith('//')
+                and str(path) == value and '..' not in path.parts and '\x00' not in value,
+                'Native source paths/prefix must be canonical absolute paths')
+    recorded_path, proof_prefix = PurePosixPath(recorded), PurePosixPath(prefix)
+    require(recorded_path.is_relative_to(proof_prefix) and recorded_path != proof_prefix,
+            'Native proof path is outside its explicit source prefix')
+    relative = recorded_path.relative_to(proof_prefix).as_posix()
+    require(required_relative is None or relative == required_relative, 'Native tool has an unexpected source-relative suffix')
+    actual = Path(source) / relative
+    if executable:
+        actual = promotion.pinned_tool(actual, checksum)
+    else:
+        actual = promotion.regular(actual, 64 * MIB)
+        require(builder.SHA.fullmatch(checksum or '') and builder.sha256(actual) == checksum,
+                'Native source file SHA256 differs')
+    return actual, {'recorded_path': recorded, 'source_relative_path': relative,
+                    'actual_path': str(actual), 'sha256': checksum}
+
+
 def make_command(operation, layout, packages):
     require(operation in ('info', 'manifest', 'image') and layout in ('stock', 'mtkuboot', 'ubootmod'), 'Invalid smoke operation/layout')
     require(packages and all(builder.NAME.fullmatch(name) for name in packages), 'Unsafe actual package name')
@@ -284,17 +308,24 @@ def prepare_native(args, context, recipe):
         defaults[layout] = {name: version for name, version in actual.items() if name != 'tailscale'}
         validate_manifest(defaults[layout], defaults[layout], context['controls'], profile['firmware']['kernel_version'], profile.get('package_manager', 'opkg'))
     tools = {}
+    proof_prefix = str(source) if args.native_source_prefix is None else args.native_source_prefix
+    mapping = {'proof_source_prefix': proof_prefix, 'actual_source': str(source), 'tools': {}}
     for name in ('fwtool', 'unsquashfs4'):
         proof = native['trusted_tools'][name]
-        path = promotion.pinned_tool(proof['path'], proof['sha256'])
-        require(path == source / 'staging_dir/host/bin' / name, 'Native inspection tool is outside the reviewed source tool path')
+        path, tool_mapping = native_source_file(proof['path'], proof_prefix, source, proof['sha256'],
+                                                required_relative='staging_dir/host/bin/' + name, executable=True)
         tools[name] = path
-    kernel = promotion.regular(native['sysupgrade_input']['path'], 64 * MIB)
-    require(kernel.is_relative_to(source) and builder.sha256(kernel) == native['sysupgrade_input']['sha256'], 'Native uncompressed kernel SHA differs')
+        mapping['tools'][name] = tool_mapping
+    kernel, kernel_mapping = native_source_file(native['sysupgrade_input']['path'], proof_prefix, source,
+                                                native['sysupgrade_input']['sha256'])
+    require(kernel_mapping['source_relative_path'].endswith('/Image')
+            and kernel_mapping['source_relative_path'] in {item['path'] for item in context['attestation']['context']},
+            'Native uncompressed kernel path is not the independently attested source-relative Image')
+    mapping['kernel'] = kernel_mapping
     configs = [context['tree'] / item['path'] for item in context['attestation']['context'] if item['path'].endswith('/.config')]
     require(len(configs) == 1, 'Ambiguous attested kernel configuration')
     context.update(verifier=verifier, overlay=overlay, defaults=defaults, tools=tools, kernel=kernel, kernel_config=configs[0].read_bytes(),
-                   native_lock=promotion.read_json(Path(args.raw) / 'lock.json'))
+                   native_lock=promotion.read_json(Path(args.raw) / 'lock.json'), native_source_mapping=mapping)
     if profile.get('package_manager', 'opkg') == 'apk':
         require(args.apk and args.apk_sha256, 'APK smoke requires a pinned host APK decoder')
         context['apk'] = promotion.pinned_tool(args.apk, args.apk_sha256)
@@ -411,6 +442,7 @@ def main(argv=None):
         parser.add_argument('--' + name, type=Path, required=True)
     parser.add_argument('--apk', type=Path)
     parser.add_argument('--apk-sha256')
+    parser.add_argument('--native-source-prefix', help='Canonical absolute source prefix recorded inside native proof (default: actual host source)')
     parser.add_argument('--run', action='store_true', help='Explicitly run actual rootless make operations; default prints validated plan')
     parser.add_argument('--lock-proof', type=Path)
     parser.add_argument('--lock-proof-sha256')
@@ -426,6 +458,7 @@ def main(argv=None):
             plan = {'make_commands_executed': False, 'image_id': args.image_id, 'identity': identity(context['profile']),
                     'archive_sha256': args.archive_sha256, 'attestation_sha256': context['approval']['attestation_sha256'],
                     'snapshot_sha256': args.snapshot_sha256, 'overlay_paths': sorted(context['overlay']),
+                    'native_source_mapping': context['native_source_mapping'],
                     'layouts': {layout: {operation: make_command(operation, layout, packages)
                                         for operation in ('info', 'manifest', 'image')}
                                 for layout, packages in context['defaults'].items()}}
@@ -449,6 +482,7 @@ def main(argv=None):
                        'rootless_engine_id': builder.ROOTLESS_ENGINE, 'native_evidence_sha256': args.native_evidence_sha256,
                        'hardkill_lock_proof_sha256': args.lock_proof_sha256, 'lock_device': lock_stat.st_dev,
                        'lock_inode': lock_stat.st_ino, 'overlay_paths': sorted(context['overlay']), 'layouts': {}}
+            receipt['native_source_mapping'] = context['native_source_mapping']
             for layout in sorted(context['defaults']):
                 receipt['layouts'][layout] = run_layout(layout, output, args, context, lock_stat)
             (output / 'evidence.json').write_text(json.dumps(receipt, indent=2, sort_keys=True) + '\n')

@@ -307,26 +307,51 @@ def _build(build_request: BuildRequest, job=None, workspace=None, engine=None):
         job.meta["imagebuilder_status"] = "validate_manifest"
         job.save_meta()
 
-        returncode, job.meta["stdout"], job.meta["stderr"] = run_cmd(
-            container,
-            [
-                "make",
-                "manifest",
-                f"PROFILE={build_request.profile}",
-                f"PACKAGES={' '.join(build_cmd_packages)}",
-            ],
-        )
+        def install_manifest():
+            job.meta["imagebuilder_status"] = "validate_manifest"
+            job.save_meta()
+            status, job.meta["stdout"], job.meta["stderr"] = run_cmd(
+                container,
+                [
+                    "make",
+                    "--no-print-directory",
+                    "-s",
+                    "manifest",
+                    f"PROFILE={build_request.profile}",
+                    f"PACKAGES={' '.join(build_cmd_packages)}",
+                ],
+            )
+            job.save_meta()
+            if status:
+                report_error(job, check_package_errors(job.meta["stderr"]))
+            from asu.manifest_policy import native_preflight_output
 
-        job.save_meta()
+            return normalize_emitted_manifest(
+                catalog,
+                parse_manifest(native_preflight_output(job.meta["stdout"], manager)),
+            )
 
-        if returncode:
-            report_error(job, check_package_errors(job.meta["stderr"]))
+        if manager == "apk":
+            from asu.public_policy import admitted_apk_manifest
 
-        # Both managers emit actual indexed names. Never infer an ABI suffix or
-        # accept an ABI-free name unless that is the approved actual identity.
-        manifest: dict[str, str] = normalize_emitted_manifest(
-            catalog, parse_manifest(job.meta["stdout"])
-        )
+            job.meta["imagebuilder_status"] = "validate_apk_origins"
+            job.save_meta()
+            manifest, proof = admitted_apk_manifest(
+                container,
+                catalog,
+                build_request.packages,
+                build_request.profile,
+                _make_tar,
+                settings.public_path,
+                lambda closure: validate_manifest(
+                    catalog, build_request.model_dump(), closure
+                ),
+                install_manifest,
+            )
+            job.meta["apk_resolution"] = proof
+            job.save_meta()
+        else:
+            manifest = install_manifest()
         log.debug(f"Manifest: {manifest}")
 
         # Check if all requested packages are in the manifest
@@ -538,6 +563,11 @@ def build(build_request: BuildRequest, job=None):
     )
     try:
         import fcntl
+        from asu.public_policy import require_free_space
+
+        require_free_space(
+            settings.public_path, {"installed_bytes": 0, "archive_bytes": 0}
+        )
 
         lock_path = getenv("ASU_GLOBAL_BUILD_LOCK", "/build-lock/.build.lock")
         with open(lock_path, "r") as lock:

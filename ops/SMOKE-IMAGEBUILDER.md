@@ -8,6 +8,7 @@ Only explicit `--run` starts bounded rootless containers and executes actual `ma
 
 - Actual native build verification evidence and its independently reviewed SHA256; the corresponding native RAW directory and original generated `profile.json`.
 - The independently reviewed native source tree, at the exact source commit, including its existing built host inspection tools and source overlay. The runner reads it; it does not prepare or modify the source tree.
+- If native verification ran inside a container, its recorded source paths may use a different namespace. Supply `--native-source-prefix` with that exact canonical absolute source prefix; it defaults to the actual host `--source`. For the verified 6.6 run, use `/build/retry1/source` while the actual host source is `/home/valuxin/dev/owrt/ax6000-packages-build/work/retry1/source`.
 - The actual matching immutable ImageBuilder archive/SHA, independent builder approval receipt/SHA, and real [builder-image load receipt](BUILDER-IMAGE.md)/SHA. The explicit immutable image ID must agree with that load receipt.
 - Actual signed snapshot manifest/SHA, its usign signature, production public usign key, and independently pinned host usign executable/SHA. Snapshot generation/cohort/profile/kernel identity and signature are checked. Promotion later verifies the complete signed tree inventory; this standalone smoke uses only the frozen native package bank and disables networking.
 - A committed package-recipe repository at its independently approved full commit. Its `scripts`, `keys`, `profiles`, and `files` must be clean. Trusted native `verify-firmware.py` helpers are imported only from this checkout.
@@ -33,7 +34,7 @@ cd /home/valuxin/dev/owrt/ax6000-asu
   --snapshot-signature /verified/snapshot/snapshot-manifest.sig \
   --public-key /trusted/package-recipe/keys/repository.pub \
   --usign /trusted/host/usign --usign-sha256 APPROVED_USIGN_SHA \
-  --source /actual/native/source --raw /actual/native/raw \
+  --source /actual/native/source --native-source-prefix /build/retry1/source --raw /actual/native/raw \
   --package-repository /trusted/package-recipe --recipe-commit APPROVED_FULL_COMMIT \
   --output /fresh/operator-smoke
 ```
@@ -45,6 +46,8 @@ For actual execution, repeat the reviewed invocation and add:
 ```
 
 For `612-recommended` or `612-latest`, use that exact cohort and add `--apk /trusted/host/apk --apk-sha256 APPROVED_HOST_APK_SHA`. All three verified layouts are required; 6.6 runs stock only. Run as the trusted operator with existing production Docker access, without sudo or additional account/group changes. No public API or worker may invoke this operator utility.
+
+The source-prefix option changes only path resolution. Every recorded tool/kernel path must be canonical, absolute and beneath that explicit prefix. Tools retain the exact `staging_dir/host/bin/fwtool` or `staging_dir/host/bin/unsquashfs4` suffix; the uncompressed kernel must resolve to an independently attested source-relative `Image`. The mapped host files still reject symlink components and require their complete approved tool/kernel SHA256, executable tool permissions, and the original native source commit. Wrong prefixes, traversal, foreign tools and changed bytes fail. No evidence file is rewritten and no `/build` host alias is created. Dry plans and smoke receipts record `native_source_mapping` with the proof prefix, actual source, and each original/relative/actual path plus digest. Omit the override when proof paths already use the actual source namespace.
 
 ## Execution and serialization
 
@@ -72,4 +75,4 @@ The utility does not promote a catalog, start APIs, publish artifacts, sign firm
 PYTHONDONTWRITEBYTECODE=1 /usr/bin/python3 -m unittest discover -s ops/tests -p test_smoke_imagebuilder.py -v
 ```
 
-Synthetic fixtures cover dry-plan engine isolation, no missing-proof bypass, shell-safe argv/actual package names, PID1 lock command, fresh nonce/inode matching, resource/privilege failures, exact overlay bytes/modes, export traversal/link rejection, manifest policies, native root hash drift, and receipt compatibility/tamper rejection against the real promoter validator. These tests create no Docker containers and provide no production smoke evidence.
+Synthetic fixtures cover dry-plan engine isolation, no missing-proof bypass, container-to-host source namespace mapping and wrong-prefix/traversal/hash/symlink rejection, shell-safe argv/actual package names, PID1 lock command, fresh nonce/inode matching, resource/privilege failures, exact overlay bytes/modes, export traversal/link rejection, manifest policies, native root hash drift, and receipt compatibility/tamper rejection against the real promoter validator. These tests create no Docker containers and provide no production smoke evidence.

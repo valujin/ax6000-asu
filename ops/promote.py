@@ -25,6 +25,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SHA = re.compile(r'[a-f0-9]{64}')
 NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.+-]{0,127}')
 MAX_JSON = 32 * 1024**2
+MAX_CATALOG = 8 * 1024**2
 CORE = {'kernel','libc','base-files','busybox','libgcc','libstdcpp','libatomic',
         'procd','procd-seccomp','procd-ujail','ubox','ubus','netifd','fstools',
         'usign','openwrt-keyring','logd','mtd','firewall4','urngd'}
@@ -47,6 +48,12 @@ def sha256(path):
 
 def canonical(data):
     return (json.dumps(data, sort_keys=True, indent=2, allow_nan=False)+'\n').encode()
+
+
+def catalog_bytes(data):
+    payload=(json.dumps(data,sort_keys=True,separators=(',',':'),allow_nan=False)+'\n').encode()
+    require(len(payload)<=MAX_CATALOG,'Complete candidate catalog exceeds the 8 MiB policy bound')
+    return payload
 
 
 def regular(path, cap=MAX_JSON):
@@ -433,16 +440,15 @@ def immutable_copy(channel,manifest_root,files,store,snapshot_sha):
     return destination
 
 
-def public_packages(registry_path,registry_sha,snapshot_sha,selected,identity,controls,protected,
-                    tree,feed,apk,apk_sha,public_key,site,mirror_root=None,mirror_prefix='/indexes'):
-    """Index-only native solver checks; APK archive fetch remains lazy in mirror."""
-    require(selected and len(selected)<=128,'Select one to 128 public userspace roots explicitly')
+def public_candidates(registry_path,registry_sha,snapshot_sha,identity,controls,protected,
+                      apk,apk_sha,site,mirror_root=None,mirror_prefix='/indexes'):
+    """Verify frozen indexes and collect candidates; mutually exclusive apps coexist."""
     mirror=load_module(ROOT/'ops/immutable_mirror.py','promote_mirror')
     registry=read_json(registry_path,registry_sha)
     require(registry.get('schema_version')==1,'Wrong mirror registry schema')
     snapshots=[s for s in registry.get('snapshots',[]) if s.get('snapshot_sha256')==snapshot_sha]
     require(len(snapshots)==1,'Mirror registry does not name this exact signed snapshot')
-    decoder=mirror.Decoder(apk,apk_sha);repositories=[];candidates={};owners={};ambiguous=set()
+    decoder=mirror.Decoder(apk,apk_sha);repositories=[];candidates={};owners={};ambiguous=set();feeds=set();distribution=None
     native_names=set(identity)|{item['name'] for item in identity.values()}
     for control in controls.values():native_names.update(provided_names(control))
     fmt=sys.modules.get('package_format')
@@ -459,20 +465,40 @@ def public_packages(registry_path,registry_sha,snapshot_sha,selected,identity,co
                 require(path.is_absolute() and path.is_relative_to(prefix) and '..' not in path.parts and str(path)==record[field],
                         'Mirror registry path is outside its container index prefix')
                 record[field]=str(Path(mirror_root).absolute()/path.relative_to(prefix))
-        require(record.get('distribution')=='immortalwrt','Initial public policy accepts only ImmortalWrt 25.12')
+        require(record.get('distribution') in {'immortalwrt','openwrt'},'Public policy requires ImmortalWrt or OpenWrt 25.12')
+        if distribution is None:distribution=record['distribution']
+        require(record['distribution']==distribution,'A frozen snapshot cannot mix public distributions')
         repo=mirror.Repository(record,decoder);repositories.append((record,repo))
+        require(repo.feed not in feeds,'Duplicate frozen public feed');feeds.add(repo.feed)
         for filename,raw in repo.rows.items():
             control=fmt.normalize_apk_info(raw);base=control['Base-Package'];name=control['Package']
+            if not NAME.fullmatch(base) or not NAME.fullmatch(name):continue
             if base in native_names or base in CORE|ASU|VENDOR or base.startswith(('kmod-','apk')) or base=='opkg':continue
             if name in native_names:continue
             aliases=re.findall(r'(?:^|,)\s*([A-Za-z0-9_.+:-]+)',control.get('Provides',''))
             if any(alias.removesuffix('-any') in protected or alias in native_names for alias in aliases):continue
-            if re.search(r'(?:^|,)\s*kernel(?:\s|\(|,|$)',control.get('Depends','')):continue
+            if re.search(r'(?:^|,)\s*(?:kernel(?:\s|\(|,|$)|kmod-)',control.get('Depends','')):continue
             if base in candidates:
                 ambiguous.add(base)
                 continue
             candidates[base]=control;owners[name]=(record,repo,filename)
     for base in ambiguous:candidates.pop(base,None)
+    origins={};indexes={};urls=[];keytexts=[]
+    for record,repo in repositories:
+        url=site+'/immutable/'+snapshot_sha+'/public/'+repo.sha+'/'+repo.feed+'/packages.adb'
+        indexes['public-'+repo.feed]={'url':url,'sha256':repo.sha}
+        urls.append('@'+PUBLIC_TAG+' '+url);keytexts.append(regular(record['key_path'],16384).read_text())
+    for base,control in candidates.items():
+        record,repo,filename=owners[control['Package']]
+        origins[base]={'repository':'public-'+repo.feed,'filename':filename,'identity_sha256':repo.rows[filename]['hashes']}
+    return {'controls':candidates,'owners':owners,'repositories':repositories,
+            'origins':origins,'indexes':indexes,'urls':urls,'keys':keytexts,'distribution':distribution}
+
+
+def solve_public(catalog,selected,identity,protected,tree,feed,apk,public_key):
+    """Validate only requested roots together; never solve the complete inventory."""
+    require(selected and len(selected)<=128,'Select one to 128 public userspace roots explicitly')
+    candidates=catalog['controls'];owners=catalog['owners'];repositories=catalog['repositories']
     require(all(name in candidates for name in selected),'Public selection collides, is protected, ambiguous, or is unavailable')
     public_by_actual={control['Package']:control for control in candidates.values()}
     with tempfile.TemporaryDirectory(prefix='asu-promote-solver-') as temporary:
@@ -489,7 +515,13 @@ def public_packages(registry_path,registry_sha,snapshot_sha,selected,identity,co
         pins=[identity[name]['name']+'='+identity[name]['version'] for name in sorted(protected)]
         requests=[candidates[name]['Package']+'@'+PUBLIC_TAG+'='+candidates[name]['Version'] for name in selected]
         command=[str(apk),'--root',str(root),'--arch','aarch64_cortex-a53','--no-network',
-                 '--keys-dir',str(keys),'--repositories-file',str(repos),'query','--from','repositories',
+                 '--keys-dir',str(keys),'--repositories-file',str(repos),'--no-cache']
+        # query.c deliberately ignores conflicts. A real simulated transaction
+        # must succeed before using query's structured closure/origin output.
+        simulated=subprocess.run([*command,'--no-scripts','--no-commit-hooks','--usermode',
+                                  'add','--simulate',*pins,*requests],capture_output=True,timeout=120)
+        require(simulated.returncode==0 and not simulated.stderr.strip(),'Native public dependency solver simulation failed')
+        command += ['query','--from','repositories',
                  '--recursive','--format','json','--fields','name,version,arch,depends,repositories,download-url',*pins,*requests]
         result=subprocess.run(command,check=True,capture_output=True,timeout=120)
         require(not result.stderr.strip() and len(result.stdout)<=32*1024**2,'Native public dependency solver reported an error')
@@ -510,11 +542,44 @@ def public_packages(registry_path,registry_sha,snapshot_sha,selected,identity,co
                     'Solver selected an unexpected public identity')
             selected_controls[control['Base-Package']]=control
         require(protected<=native_names and set(selected)<=set(selected_controls),'Solver omitted required native/public identities')
-    urls=[];keytexts=[]
-    for record,repo in repositories:
-        urls.append('@'+PUBLIC_TAG+' '+site+'/immutable/'+snapshot_sha+'/public/'+repo.sha+'/'+repo.feed+'/packages.adb')
-        keytexts.append(regular(record['key_path'],16384).read_text())
-    return selected_controls,urls,keytexts
+    return selected_controls
+
+
+def public_packages(registry_path,registry_sha,snapshot_sha,selected,identity,controls,protected,
+                    tree,feed,apk,apk_sha,public_key,site,mirror_root=None,mirror_prefix='/indexes'):
+    catalog=public_candidates(registry_path,registry_sha,snapshot_sha,identity,controls,protected,
+                              apk,apk_sha,site,mirror_root,mirror_prefix)
+    selected_controls=solve_public(catalog,selected,identity,protected,tree,feed,apk,public_key)
+    return selected_controls,catalog['urls'],catalog['keys']
+
+
+def apk_origins(index,apk,repository,identity):
+    """Bind selected canonical identities to their full signed ADB row hashes."""
+    fmt=sys.modules.get('package_format');require(fmt is not None,'Trusted APK decoder missing')
+    result={}
+    for control in fmt.index_info(index,apk=apk):
+        base,item=package_identity(control)
+        if base not in identity or item!=identity[base]:continue
+        digest=control['APK-Raw'].get('hashes','')
+        require(SHA.fullmatch(digest) and base not in result,'Invalid or duplicate indexed APK identity')
+        result[base]={'repository':repository,'filename':item['name']+'-'+item['version']+'.apk','identity_sha256':digest}
+    return result
+
+
+def merge_supplement(identity,controls,protected,native_hashes,packages):
+    """Native manifests were verified against the native bank before this merge."""
+    aliases=set().union(*(provided_names(controls[name]) for name in protected))
+    changed=set()
+    for path,control in packages:
+        base,item=package_identity(control)
+        if base in protected:
+            require(base in controls and control==controls[base] and sha256(path)==native_hashes[base],
+                    'Supplemental feed changes a protected native package')
+            continue
+        require(not (provided_names(control)&aliases),'Supplemental feed provides a protected native identity')
+        require(not base.startswith(('kmod-mt76','kmod-mt7915','kmod-mt7986-firmware')),'Supplemental feed contains foreign Wi-Fi stack')
+        identity[base]=item;controls[base]=control;changed.add(base)
+    return changed
 
 
 def promote(args):
@@ -595,29 +660,31 @@ def promote(args):
                                   'max_image_size':sum(item['size'] for item in partitions.values())}
             protected.update(name for name in identity if name.startswith('kmod-'))
             native_hashes={package_identity(item['control'])[0]:item['sha256'] for item in attestation['packages']}
-            protected_aliases=set().union(*(provided_names(controls[name]) for name in protected))
             feed=channel/'feeds'/profile['id']/profile['firmware']['kernel_version']
-            for path in sorted(feed.glob('*.'+suffix)):
-                control=publisher.read_control(path,**({'apk':apk} if apk and args.cohort!='66' else {}))
-                base,item_identity=package_identity(control)
-                if base in protected:
-                    require(base in controls and control==controls[base] and sha256(path)==native_hashes[base],
-                            'Supplemental feed changes a protected native package')
-                    continue
-                require(not (provided_names(control)&protected_aliases),'Supplemental feed provides a protected native identity')
-                require(not base.startswith(('kmod-mt76','kmod-mt7915','kmod-mt7986-firmware')),'Supplemental feed contains foreign Wi-Fi stack')
-                identity[base]=item_identity;controls[base]=control
+            origins=apk_origins(tree/'packages/packages.adb',apk,'native',identity) if args.cohort!='66' else {}
+            packages=[(path,publisher.read_control(path,**({'apk':apk} if args.cohort!='66' else {})))
+                      for path in sorted(feed.glob('*.'+suffix))]
+            changed=merge_supplement(identity,controls,protected,native_hashes,packages)
             repositories=[site+'/immutable/'+snapshot_sha+'/channel/'+feed.relative_to(channel).as_posix()+('/packages.adb' if args.cohort!='66' else '')]
             keytexts=[public_key.read_text() if args.cohort=='66' else Path(args.apk_public_key).read_text()]
-            if args.public_package:
+            indexes={}
+            if args.cohort!='66':
+                supplemental_origins=apk_origins(feed/'packages.adb',apk,'supplement',identity)
+                require(changed<=set(supplemental_origins),'Supplemental identities are absent from the verified index')
+                origins.update({base:supplemental_origins[base] for base in changed})
+                indexes={'native':{'url':'file:///builder/packages/packages.adb','sha256':sha256(tree/'packages/packages.adb')},
+                         'supplement':{'url':repositories[0],'sha256':sha256(feed/'packages.adb')}}
+            if args.public_package or args.public_candidates:
                 require(args.cohort!='66' and args.mirror_registry and args.mirror_registry_sha256,'Public APK roots require a pinned mirror registry')
                 solver_pins=set().union(*(set(p['mandatory_packages']) for p in profiles.values()))
-                selected,urls,keys=public_packages(args.mirror_registry,args.mirror_registry_sha256,snapshot_sha,
-                    args.public_package,identity,controls,solver_pins,tree,feed,apk,args.apk_sha256,args.apk_public_key,site,
-                    args.mirror_root,args.mirror_prefix)
+                public=public_candidates(args.mirror_registry,args.mirror_registry_sha256,snapshot_sha,
+                    identity,controls,solver_pins,apk,args.apk_sha256,site,args.mirror_root,args.mirror_prefix)
+                selected=(public['controls'] if args.public_candidates else
+                          solve_public(public,args.public_package,identity,solver_pins,tree,feed,apk,args.apk_public_key))
                 for base,control in selected.items():
                     identity[base]={'name':control['Package'],'abi':control.get('ABIVersion',''),'version':control['Version'],'tag':PUBLIC_TAG}
-                repositories+=urls;keytexts+=keys
+                origins.update({base:public['origins'][base] for base in selected});indexes.update(public['indexes'])
+                repositories+=public['urls'];keytexts+=public['keys']
             smoke_evidence(smoke,Path(args.imagebuilder_evidence).parent,profile,approval['attestation_sha256'],snapshot_sha,
                            native['layouts'],installed,identity)
             feed_receipt={'schema_version':1,'kind':'asu-feed-verification','snapshot_sha256':snapshot_sha,
@@ -641,7 +708,12 @@ def promote(args):
                   'repository_keys':list(dict.fromkeys(keytexts))}
             if args.cohort!='66':
                 data['apk_protected_roots']=apk_protected_roots(source,attestation)
-            payload=canonical(data);catalog_sha=hashlib.sha256(payload).hexdigest()
+                require(set(origins)==set(identity),'APK catalog origins do not cover every approved identity')
+                data.update(apk_repositories=indexes,package_origins=origins)
+                if args.public_candidates or args.public_package:
+                    data['public_policy']={'mode':'candidates' if args.public_candidates else 'validated-subset',
+                                           'distribution':public['distribution'],'tag':PUBLIC_TAG}
+            payload=catalog_bytes(data);catalog_sha=hashlib.sha256(payload).hexdigest()
             # Server policy imports its stdlib-only overlay validator by package
             # name; the operator may invoke this script from any directory.
             sys.path.insert(0,str(ROOT))
@@ -673,7 +745,9 @@ def main(argv=None):
     parser.add_argument('--apk',type=Path);parser.add_argument('--apk-sha256');parser.add_argument('--apk-public-key',type=Path)
     parser.add_argument('--mirror-registry',type=Path);parser.add_argument('--mirror-registry-sha256')
     parser.add_argument('--mirror-root',type=Path);parser.add_argument('--mirror-prefix',default='/indexes')
-    parser.add_argument('--public-package',action='append',default=[])
+    public=parser.add_mutually_exclusive_group()
+    public.add_argument('--public-package',action='append',default=[])
+    public.add_argument('--public-candidates',action='store_true')
     args=parser.parse_args(argv)
     try:print(json.dumps(promote(args),sort_keys=True))
     except (ValueError,OSError,KeyError,TypeError,subprocess.SubprocessError) as error:

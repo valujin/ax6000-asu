@@ -66,6 +66,30 @@ class PromotionGuards(unittest.TestCase):
         manifest.write_text('base-files - 2-r1\n')
         with self.assertRaisesRegex(ValueError,'version differs'):promote.parse_manifest(manifest,identity)
 
+    def test_daily_userspace_update_preserves_native_default_names_and_core_bytes(self):
+        controls={'libc':{'Package':'libc','Version':'1-r1'},
+                  'pbr':{'Package':'pbr','Version':'1-r1','Depends':'libc'}}
+        identity,_=promote.identities([{'control':c} for c in controls.values()])
+        manifest=self.root/'native.manifest';manifest.write_text('libc - 1-r1\npbr - 1-r1\n')
+        native=promote.parse_manifest(manifest,identity)
+        update=self.root/'pbr.apk';update.write_bytes(b'new approved daily archive')
+        changed=promote.merge_supplement(identity,controls,{'libc'},{'libc':'a'*64},
+                                        [(update,{'Package':'pbr','Version':'2-r1','Depends':'libc'})])
+        self.assertEqual(changed,{'pbr'})
+        target=self.root/'target.manifest';target.write_text('libc - 1-r1\npbr - 2-r1\n')
+        self.assertEqual(set(promote.parse_manifest(target,identity)),set(native))
+        with self.assertRaisesRegex(ValueError,'version differs'):promote.parse_manifest(manifest,identity)
+        with self.assertRaisesRegex(ValueError,'protected native'):
+            promote.merge_supplement(identity,controls,{'libc'},{'libc':'a'*64},
+                                     [(update,{'Package':'libc','Version':'2-r1'})])
+
+    def test_catalog_encoding_is_compact_bounded_and_lossless(self):
+        data={'packages':{'ordinary-app':'1-r1'},'unicode':'fixture'}
+        payload=promote.catalog_bytes(data)
+        self.assertEqual(json.loads(payload),data);self.assertLess(len(payload),len(promote.canonical(data)))
+        with self.assertRaisesRegex(ValueError,'8 MiB'):
+            promote.catalog_bytes({'oversized':'a'*promote.MAX_CATALOG})
+
     def test_opkg_and_apk_strip_only_the_exact_declared_abi_suffix(self):
         for control in ({'Package':'libubox20240329','ABIVersion':'20240329','Version':'1-r1'},
                         {'Package':'libubox20240329','Base-Package':'libubox','ABIVersion':'20240329','Version':'1-r1'}):
@@ -274,12 +298,14 @@ class PublicSolver(unittest.TestCase):
     def command(self,*args):
         return subprocess.run(list(map(str,args)),check=True,capture_output=True,timeout=30)
 
-    def package(self,directory,name,depends=None):
-        payload=self.root/('payload-'+name);payload.mkdir();(payload/'fixture').write_text(name)
+    def package(self,directory,name,depends=None,provides=None,abi=None):
+        payload=self.root/('payload-'+directory.name+'-'+name);payload.mkdir();(payload/'fixture').write_text(name)
         path=directory/(name+'-1-r1.apk')
         args=[APK,'--no-network','mkpkg','--info','name:'+name,'--info','version:1-r1','--info','arch:aarch64_cortex-a53',
               '--files',payload,'--output',path]
         if depends:args+=['--info','depends:'+depends]
+        if provides:args+=['--info','provides:'+provides]
+        if abi:args+=['--info','tags:openwrt:abiversion='+abi]
         self.command(*args);return path
 
     def index(self,directory,packages):
@@ -295,6 +321,75 @@ class PublicSolver(unittest.TestCase):
         self.assertTrue(urls[0].startswith('@public '))
         self.assertIn('/immutable/'+self.snapshot+'/public/',urls[0])
         self.assertFalse((self.root/'cache').exists())
+
+    def test_openwrt_whole_snapshot_alternative_uses_the_same_native_guards(self):
+        registry=json.loads(self.registry.read_text())
+        record=registry['snapshots'][0]['repositories'][0]
+        record.update(distribution='openwrt',base_url='https://downloads.openwrt.org/releases/25.12.0/packages/aarch64_cortex-a53/packages/')
+        self.registry.write_text(json.dumps(registry))
+        candidates=promote.public_candidates(self.registry,promote.sha256(self.registry),self.snapshot,
+            self.identity,self.controls,{'libc'},APK,promote.sha256(APK),'https://asu.ezon.by')
+        self.assertEqual(candidates['distribution'],'openwrt')
+        controls,urls,_=self.select(['userapp'])
+        self.assertEqual(set(controls),{'userapp'});self.assertTrue(urls[0].startswith('@public '))
+        with self.assertRaisesRegex(ValueError,'collides'):self.select(['libc'])
+        with self.assertRaisesRegex(ValueError,'solver|closure'):self.select(['foreign'])
+
+    def test_frozen_snapshot_rejects_mixed_public_distributions(self):
+        registry=json.loads(self.registry.read_text())
+        repositories=registry['snapshots'][0]['repositories']
+        other=dict(repositories[0]);other.update(feed='base',distribution='openwrt',
+            base_url='https://downloads.openwrt.org/releases/25.12.0/packages/aarch64_cortex-a53/base/')
+        repositories.append(other);self.registry.write_text(json.dumps(registry))
+        with self.assertRaisesRegex(ValueError,'mix public distributions'):
+            promote.public_candidates(self.registry,promote.sha256(self.registry),self.snapshot,
+                self.identity,self.controls,{'libc'},APK,promote.sha256(APK),'https://asu.ezon.by')
+
+    def test_candidates_keep_unlisted_apps_and_mutually_exclusive_alternatives(self):
+        packages=[self.official/'userapp-1-r1.apk',self.official/'foreign-1-r1.apk']
+        packages += [self.package(self.official,'ordinary-app',depends='libc'),
+                     self.package(self.official,'alternative-a',depends='libc !alternative-b'),
+                     self.package(self.official,'alternative-b',depends='libc !alternative-a')]
+        self.index(self.official,packages)
+        registry=json.loads(self.registry.read_text())
+        registry['snapshots'][0]['repositories'][0]['index_sha256']=promote.sha256(self.official/'packages.adb')
+        self.registry.write_text(json.dumps(registry))
+        candidates=promote.public_candidates(self.registry,promote.sha256(self.registry),self.snapshot,
+            self.identity,self.controls,{'libc'},APK,promote.sha256(APK),'https://asu.ezon.by')
+        self.assertEqual(set(candidates['controls']),{'userapp','foreign','ordinary-app','alternative-a','alternative-b'})
+        for name in ('ordinary-app','alternative-a','alternative-b'):
+            selected,_,_=self.select([name]);self.assertEqual(set(selected),{name})
+        with self.assertRaisesRegex(ValueError,'solver|closure'):self.select(['alternative-a','alternative-b'])
+        origin=candidates['origins']['ordinary-app']
+        raw=self.format.index_info(self.official/'packages.adb',APK)
+        expected=next(row['APK-Raw']['hashes'] for row in raw if row['Package']=='ordinary-app')
+        self.assertEqual(origin,{'repository':'public-packages','filename':'ordinary-app-1-r1.apk','identity_sha256':expected})
+        self.assertEqual(candidates['indexes']['public-packages']['sha256'],promote.sha256(self.official/'packages.adb'))
+
+    def test_native_index_origins_bind_full_index_identity_not_archive_digest(self):
+        origins=promote.apk_origins(self.tree/'packages/packages.adb',APK,'native',self.identity)
+        self.assertEqual(set(origins),{'libc'})
+        self.assertEqual(origins['libc']['filename'],'libc-1-r1.apk')
+        self.assertRegex(origins['libc']['identity_sha256'],r'^[a-f0-9]{64}$')
+        self.assertNotEqual(origins['libc']['identity_sha256'],promote.sha256(self.native))
+
+    def test_candidates_exclude_managers_kmods_native_providers_and_ambiguous_abis(self):
+        packages=[self.official/'userapp-1-r1.apk',self.official/'foreign-1-r1.apk']
+        packages += [self.package(self.official,'libc'),self.package(self.official,'public-libc',provides='libc=1-r1'),
+                     self.package(self.official,'apk-openssl'),self.package(self.official,'kmod-fixture'),
+                     self.package(self.official,'kmod-user',depends='kmod-fixture'),
+                     self.package(self.official,'libambiguous2025',abi='2025'),
+                     self.package(self.official,'libambiguous2026',abi='2026'),
+                     self.package(self.official,'libapproved2026',abi='2026')]
+        self.index(self.official,packages)
+        registry=json.loads(self.registry.read_text())
+        registry['snapshots'][0]['repositories'][0]['index_sha256']=promote.sha256(self.official/'packages.adb')
+        self.registry.write_text(json.dumps(registry))
+        candidates=promote.public_candidates(self.registry,promote.sha256(self.registry),self.snapshot,
+            self.identity,self.controls,{'libc'},APK,promote.sha256(APK),'https://asu.ezon.by')
+        self.assertEqual(set(candidates['controls']),{'userapp','foreign','libapproved'})
+        self.assertEqual(candidates['controls']['libapproved']['Package'],'libapproved2026')
+        self.assertEqual(candidates['controls']['libapproved']['ABIVersion'],'2026')
 
     @unittest.skipUnless((RECIPES/'packages612/tests/test_apk_world.py').is_file(),'native guard fixture required')
     def test_native_public_world_tag_survives_install_guard_and_repository_reuse(self):

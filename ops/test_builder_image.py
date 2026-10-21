@@ -150,6 +150,66 @@ class BuilderImageTests(unittest.TestCase):
         self.assertFalse(image.private_key_content(base64.b64encode(b'Ed' + b'k' * 40)))
         self.assertFalse(image.private_key_content(base64.b64encode(b'Ed' + b'k' * 72)))
 
+    def test_vendor_exception_inventory_rejects_unknown_or_incomplete_approvals(self):
+        entry = copy.deepcopy(image.PUBLIC_VENDOR_TOOL)
+        self.assertEqual(image.reviewed_vendor_tools({'reviewed_public_vendor_tools': [entry]}), {entry['path']: entry})
+        invalid = [None, {}, [entry, entry], [entry | {'path': 'staging_dir/host/bin/other-tool'}],
+                   [entry | {'sha256': '0' * 64}], [entry | {'size': entry['size'] + 1}],
+                   [entry | {'classification': 'signing-credential'}], [entry | {'source_commit': '0' * 40}],
+                   [entry | {'source_header_sha256': '0' * 64}], [entry | {'source_implementation_sha256': '0' * 64}],
+                   [{key: value for key, value in entry.items() if key != 'source_repository'}],
+                   [entry | {'allow_all_keys': True}]]
+        for value in invalid:
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                image.reviewed_vendor_tools({'reviewed_public_vendor_tools': value})
+
+    def test_vendor_exception_requires_reapproved_receipt_digest(self):
+        self.proof['reviewed_public_vendor_tools'] = [copy.deepcopy(image.PUBLIC_VENDOR_TOOL)]
+        self.proof_file.write_text(json.dumps(self.proof))
+        with self.assertRaisesRegex(ValueError, 'receipt hash differs'):
+            self.validate()
+
+    def test_public_vendor_fixture_exception_is_exact_and_cannot_hide_other_secrets(self):
+        # A deliberately synthetic ELF/key marker exercises the exact-byte gate;
+        # production constants remain pinned to the independently reviewed blob.
+        public_fixture = bytearray(b'\x7fELF\x02\x01\x01' + b'\0' * 13)
+        public_fixture[18:20] = b'\x3e\x00'
+        public_fixture = bytes(public_fixture) + b'\n-----BEGIN RSA PRIVATE KEY-----\nSYNTHETIC PUBLIC FACTORY FIXTURE\n'
+        entry = copy.deepcopy(image.PUBLIC_VENDOR_TOOL)
+        entry.update(sha256=digest(public_fixture), size=len(public_fixture))
+        proof = self.proof | {'reviewed_public_vendor_tools': [entry]}
+        files = self.files | {entry['path']: public_fixture}
+        with patch.object(image, 'PUBLIC_VENDOR_TOOL', entry):
+            tree = image.unpack(self.make_archive(files), self.root / 'vendor-unpacked')
+            result = image.scan_tree(tree, proof)
+            self.assertEqual(result['reviewed_public_vendor_tools'], [entry])
+            with self.assertRaisesRegex(ValueError, 'Private key marker'):
+                image.scan_tree(tree, self.proof)
+            path = tree / entry['path']
+            for bad in (public_fixture + b'-----BEGIN OPENSSH PRIVATE KEY-----', public_fixture[:-1] + b'!'):
+                path.write_bytes(bad)
+                with self.assertRaises(ValueError):
+                    image.scan_tree(tree, proof)
+                path.write_bytes(public_fixture)
+            for name, contents in [('other-tool.bin', public_fixture), ('key-build', b'native secret'),
+                                   ('innocent.txt', b'-----BEGIN OPENSSH PRIVATE KEY-----')]:
+                other = tree / name
+                other.write_bytes(contents)
+                with self.assertRaises(ValueError):
+                    image.scan_tree(tree, proof)
+                other.unlink()
+            path.unlink()
+            with self.assertRaises(ValueError):
+                image.scan_tree(tree, proof)
+
+    def test_actual_reviewed_public_vendor_elf_when_available(self):
+        default = '/home/valuxin/dev/owrt/asu-pbr-db-2026-10-21/native66/ib-verification/expanded/immortalwrt-imagebuilder-mediatek-filogic.Linux-x86_64/' + image.PUBLIC_VENDOR_TOOL['path']
+        path = Path(os.environ.get('BUILDER_TEST_PUBLIC_VENDOR_TOOL', default))
+        if not path.is_file():
+            self.skipTest('Set BUILDER_TEST_PUBLIC_VENDOR_TOOL to the independently reviewed upstream ELF')
+        image.verify_reviewed_vendor_tool(path, image.PUBLIC_VENDOR_TOOL)
+        self.assertEqual(image.sha256(path), image.PUBLIC_VENDOR_TOOL['sha256'])
+
     def test_safe_internal_symlinks_and_hardlinks_accepted(self):
         sym = tarfile.TarInfo('imagebuilder/Makefile.link')
         sym.type, sym.linkname = tarfile.SYMTYPE, 'Makefile'
@@ -206,6 +266,74 @@ class BuilderImageTests(unittest.TestCase):
                 image.build_load(self.root, self.proof, self.proof_sha, self.root / 'fresh-output')
         docker.assert_not_called()
         self.assertFalse((self.root / 'fresh-output').exists())
+
+    def saved_image_fixture(self):
+        # Synthetic Docker/OCI transport fixture, never loaded into a daemon.
+        def encoded(value):
+            return json.dumps(value, sort_keys=True, separators=(',', ':')).encode()
+
+        layer = b'SYNTHETIC UNIT LAYER, NOT A LOADABLE ROOTFS'
+        layer_id = 'sha256:' + digest(layer)
+        config = encoded({'architecture': 'amd64', 'os': 'linux', 'rootfs': {'type': 'layers', 'diff_ids': [layer_id]}})
+        config_id = 'sha256:' + digest(config)
+        manifest = encoded({'schemaVersion': 2, 'mediaType': 'application/vnd.oci.image.manifest.v1+json',
+            'config': {'mediaType': 'application/vnd.oci.image.config.v1+json', 'digest': config_id, 'size': len(config)},
+            'layers': [{'mediaType': 'application/vnd.oci.image.layer.v1.tar', 'digest': layer_id, 'size': len(layer)}]})
+        manifest_id = 'sha256:' + digest(manifest)
+        index = {'schemaVersion': 2, 'mediaType': 'application/vnd.oci.image.index.v1+json', 'manifests': [
+            {'mediaType': 'application/vnd.oci.image.manifest.v1+json', 'digest': manifest_id, 'size': len(manifest)}]}
+        blob = lambda value: 'blobs/sha256/' + value.split(':', 1)[1]
+        files = {blob(layer_id): layer, blob(config_id): config, blob(manifest_id): manifest,
+                 'index.json': encoded(index), 'oci-layout': encoded({'imageLayoutVersion': '1.0.0'}),
+                 'manifest.json': encoded([{'Config': blob(config_id), 'RepoTags': None, 'Layers': [blob(layer_id)]}])}
+        return files, config_id, manifest_id, [layer_id]
+
+    def write_saved_image(self, files, extra=()):
+        target = self.root / ('saved-' + str(len(list(self.root.glob('saved-*')))) + '.tar')
+        with tarfile.open(target, 'w') as archive:
+            for name, data in list(files.items()) + list(extra):
+                entry = tarfile.TarInfo(name)
+                entry.size = len(data)
+                archive.addfile(entry, io.BytesIO(data))
+        return target
+
+    def test_cross_store_ids_must_both_derive_from_exact_verified_saved_image(self):
+        files, config_id, manifest_id, layers = self.saved_image_fixture()
+        saved = image.saved_image_identity(self.write_saved_image(files), config_id, layers)
+        self.assertEqual(saved['config_id'], config_id)
+        self.assertEqual(saved['oci_manifest_id'], manifest_id)
+        self.assertEqual(saved['oci_manifest_sha256'], manifest_id.split(':')[1])
+        for value in (config_id, manifest_id):
+            self.assertEqual(image.loaded_image_id('Loaded image ID: ' + value + '\n', saved), value)
+        for output in ('', 'Loaded image ID: sha256:' + '0' * 64 + '\n', 'Loaded image: moving:tag\n',
+                       'Loaded image ID: ' + manifest_id + '\nError unpacking image: failed\n',
+                       'Loaded image ID: ' + config_id + '\nLoaded image ID: ' + manifest_id + '\n'):
+            with self.assertRaises(ValueError):
+                image.loaded_image_id(output, saved)
+
+    def test_saved_image_rejects_tampered_blobs_config_layers_and_multiple_manifests(self):
+        files, config_id, manifest_id, layers = self.saved_image_fixture()
+        for name in [key for key in files if key.startswith('blobs/')]:
+            with self.subTest(blob=name), self.assertRaises(ValueError):
+                image.saved_image_identity(self.write_saved_image(files | {name: files[name] + b'changed'}), config_id, layers)
+        with self.assertRaises(ValueError):
+            image.saved_image_identity(self.write_saved_image(files), 'sha256:' + '0' * 64, layers)
+        with self.assertRaises(ValueError):
+            image.saved_image_identity(self.write_saved_image(files), config_id, ['sha256:' + '0' * 64])
+        for kind in ('multiple', 'wrong-size'):
+            index = json.loads(files['index.json'])
+            if kind == 'multiple':
+                index['manifests'].append(copy.deepcopy(index['manifests'][0]))
+            else:
+                index['manifests'][0]['size'] += 1
+            with self.assertRaises(ValueError):
+                image.saved_image_identity(self.write_saved_image(files | {'index.json': json.dumps(index).encode()}), config_id, layers)
+        with self.assertRaises(ValueError):
+            image.saved_image_identity(self.write_saved_image(files | {'manifest.json': b'[]'}), config_id, layers)
+        with self.assertRaises(ValueError):
+            image.saved_image_identity(self.write_saved_image(files, [('index.json', files['index.json'])]), config_id, layers)
+        with self.assertRaises(ValueError):
+            image.saved_image_identity(self.write_saved_image(files | {'../../escape': b'unsafe'}), config_id, layers)
 
     def test_rootless_client_uses_explicit_socket_and_never_mounts_production_socket(self):
         with patch.object(image, 'docker') as docker:

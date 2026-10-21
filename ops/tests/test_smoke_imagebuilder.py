@@ -38,6 +38,61 @@ class SmokeRunnerTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             smoke.make_command('image', 'stock', ['busybox;touch /tmp/unsafe'])
 
+    def test_container_proof_namespace_maps_to_pinned_host_source_files(self):
+        source = self.root / 'host-source'
+        tool = source / 'staging_dir/host/bin/fwtool'
+        tool.parent.mkdir(parents=True)
+        tool.write_bytes(b'SYNTHETIC HOST TOOL; NEVER EXECUTED')
+        tool.chmod(0o755)
+        checksum = hashlib.sha256(tool.read_bytes()).hexdigest()
+        recorded = '/build/retry1/source/staging_dir/host/bin/fwtool'
+        actual, mapping = smoke.native_source_file(recorded, '/build/retry1/source', source, checksum,
+                                                   required_relative='staging_dir/host/bin/fwtool', executable=True)
+        self.assertEqual(actual, tool)
+        self.assertEqual(mapping['recorded_path'], recorded)
+        self.assertEqual(mapping['actual_path'], str(tool))
+        kernel = source / 'build_dir/target-test/linux-mediatek_filogic/Image'
+        kernel.parent.mkdir(parents=True)
+        kernel.write_bytes(b'SYNTHETIC UNCOMPRESSED KERNEL; NOT FIRMWARE')
+        kernel_sha = hashlib.sha256(kernel.read_bytes()).hexdigest()
+        actual, mapping = smoke.native_source_file('/build/retry1/source/build_dir/target-test/linux-mediatek_filogic/Image',
+                                                   '/build/retry1/source', source, kernel_sha)
+        self.assertEqual(actual, kernel)
+        self.assertEqual(mapping['source_relative_path'], 'build_dir/target-test/linux-mediatek_filogic/Image')
+        # Omitting a namespace override preserves the original same-source contract.
+        actual, _ = smoke.native_source_file(str(kernel), str(source), source, kernel_sha)
+        self.assertEqual(actual, kernel)
+        with self.assertRaises(ValueError):
+            smoke.native_source_file('/build/retry1/source/build_dir/target-test/linux-mediatek_filogic/Image',
+                                     '/build/retry1/source', source, '0' * 64)
+
+    def test_namespace_mapping_rejects_foreign_prefix_escape_hash_and_symlinks(self):
+        source = self.root / 'host-source'
+        tool = source / 'staging_dir/host/bin/fwtool'
+        tool.parent.mkdir(parents=True)
+        tool.write_bytes(b'PINNED SYNTHETIC TOOL')
+        tool.chmod(0o755)
+        checksum = hashlib.sha256(tool.read_bytes()).hexdigest()
+        good = '/build/retry1/source/staging_dir/host/bin/fwtool'
+        for recorded, prefix in [(good, '/wrong/source'), (good, '/build/retry1'),
+                                  (good, 'build/retry1/source'), (good, '/build//retry1/source'),
+                                  ('/build/retry1/source/../foreign/fwtool', '/build/retry1/source'),
+                                  ('/build/retry1/source/staging_dir/host/bin/other-tool', '/build/retry1/source')]:
+            with self.subTest(recorded=recorded, prefix=prefix), self.assertRaises(ValueError):
+                smoke.native_source_file(recorded, prefix, source, checksum,
+                                         required_relative='staging_dir/host/bin/fwtool', executable=True)
+        with self.assertRaises(ValueError):
+            smoke.native_source_file(good, '/build/retry1/source', source, '0' * 64,
+                                     required_relative='staging_dir/host/bin/fwtool', executable=True)
+        tool.unlink()
+        outside = self.root / 'outside-tool'
+        outside.write_bytes(b'PINNED SYNTHETIC TOOL')
+        outside.chmod(0o755)
+        tool.symlink_to(outside)
+        with self.assertRaises(ValueError):
+            smoke.native_source_file(good, '/build/retry1/source', source, checksum,
+                                     required_relative='staging_dir/host/bin/fwtool', executable=True)
+
     def test_manifest_rejects_foreign_versions_dropped_defaults_and_tailscale(self):
         smoke.validate_manifest(self.defaults, self.defaults, self.controls, self.profile['firmware']['kernel_version'], 'opkg')
         for actual in [self.defaults | {'foreign': '1'}, self.defaults | {'busybox': '2'},
@@ -173,7 +228,8 @@ class SmokeRunnerTests(unittest.TestCase):
 
     def context(self):
         return {'profile': self.profile, 'approval': {'attestation_sha256': 'a' * 64},
-                'defaults': {'stock': self.defaults}, 'overlay': {'etc/asu-cohort.json': {}}}
+                'defaults': {'stock': self.defaults}, 'overlay': {'etc/asu-cohort.json': {}},
+                'native_source_mapping': {'proof_source_prefix': '/synthetic/source', 'actual_source': str(self.root)}}
 
     def test_default_dry_plan_never_contacts_docker_or_writes_receipt(self):
         context = self.context()
@@ -185,6 +241,7 @@ class SmokeRunnerTests(unittest.TestCase):
             result = json.loads(stdout.getvalue())
         self.assertFalse(result['make_commands_executed'])
         self.assertEqual(set(result['layouts']), {'stock'})
+        self.assertEqual(result['native_source_mapping'], context['native_source_mapping'])
         self.assertFalse((self.root / 'fresh').exists())
         client.assert_not_called()
 

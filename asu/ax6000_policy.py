@@ -361,6 +361,9 @@ def _validate_catalog(d, cohort):
         and all(isinstance(k, str) and len(k) < 8192 for k in d["repository_keys"]),
         "Missing repository public keys",
     )
+    from asu.public_policy import validate_origin_catalog
+
+    validate_origin_catalog(d)
 
 
 def protected_packages(data):
@@ -451,11 +454,27 @@ def validate_request(catalog, request):
     require(
         isinstance(names, list)
         and isinstance(versions, dict)
-        and len(names) + len(versions) <= MAX_PACKAGES,
+        and len(names) <= MAX_PACKAGES
+        and len(versions) <= MAX_PACKAGES,
         "Package request exceeds limit",
     )
-    names = list(set(names) | set(versions))
-    for name in names:
+    installed = request.get("installed_packages", [])
+    require(
+        isinstance(installed, list)
+        and len(installed) <= MAX_PACKAGES
+        and all(isinstance(x, str) and NAME.fullmatch(x) for x in installed),
+        "Invalid installed package list",
+    )
+    require(
+        all(isinstance(x, str) and NAME.fullmatch(x) for x in names),
+        "Unknown or unsafe package",
+    )
+    require(
+        all(name in d["packages"] for name in installed),
+        "Installed package unavailable in approved snapshot",
+    )
+    names = set(names) | set(versions)
+    for name in names | set(installed):
         require(
             isinstance(name, str) and NAME.fullmatch(name) and name in d["packages"],
             "Unknown or unsafe package",
@@ -471,22 +490,22 @@ def validate_request(catalog, request):
             version == d["packages"].get(name),
             "Requested target package version is unavailable",
         )
-    installed = request.get("installed_packages", [])
-    require(
-        isinstance(installed, list)
-        and len(installed) <= MAX_PACKAGES
-        and all(isinstance(x, str) and NAME.fullmatch(x) for x in installed),
-        "Invalid installed package list",
-    )
     require(
         "tailscale" not in names or "tailscale" in installed,
         "Tailscale must already be installed",
     )
-    packages = sorted(set(names) | set(d["profiles"][profile]["mandatory_packages"]))
+    packages = sorted(
+        names | set(installed) | set(d["profiles"][profile]["mandatory_packages"])
+    )
+    require(
+        len(packages) <= MAX_PACKAGES,
+        "Combined installed/requested package set exceeds limit",
+    )
     return {
         **request,
         "profile": profile,
         "packages": packages,
+        "installed_packages": sorted(set(installed)),
         "packages_versions": versions,
         "version_code": d["firmware"]["version_code"],
         "diff_packages": True,
@@ -526,6 +545,10 @@ def validate_manifest(catalog, request, manifest):
     require(
         set(request["packages"]) <= set(manifest),
         "ImageBuilder dropped requested packages",
+    )
+    require(
+        set(request.get("installed_packages", [])) <= set(manifest),
+        "ImageBuilder dropped installed packages",
     )
     for name, version in manifest.items():
         require(

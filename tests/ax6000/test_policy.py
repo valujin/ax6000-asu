@@ -154,6 +154,29 @@ class PolicyTests(unittest.TestCase):
             "@public https://example.invalid/" + "c" * 64 + "/public/packages.adb\n"
         )
         f["package_specs"] = {"public-foo": "public-foo@public=2.3-r1"}
+        f["public_policy"] = {
+            "mode": "validated-subset",
+            "distribution": "immortalwrt",
+            "tag": "public",
+        }
+        f["apk_repositories"] = {
+            "native": {
+                "url": "file:///builder/packages/packages.adb",
+                "sha256": "1" * 64,
+            },
+            "public-packages": {
+                "url": "https://example.invalid/" + "c" * 64 + "/public/packages.adb",
+                "sha256": "2" * 64,
+            },
+        }
+        f["package_origins"] = {
+            name: {
+                "repository": "public-packages" if item["tag"] else "native",
+                "filename": item["name"] + "-" + item["version"] + ".apk",
+                "identity_sha256": "3" * 64,
+            }
+            for name, item in f["package_identities"].items()
+        }
         c = self.load(f)
         r = self.request(c)
         r["packages"].append("public-foo")
@@ -345,6 +368,51 @@ class PolicyTests(unittest.TestCase):
         r["packages"].append("tailscale")
         r["installed_packages"] = ["tailscale"]
         self.assertIn("tailscale", validate_request(c, r)["packages"])
+
+    def test_installed_tailscale_preserved_when_omitted_from_requested_names(self):
+        c = self.load()
+        r = self.request(c)
+        r["installed_packages"] = ["tailscale"]
+        self.assertIn("tailscale", validate_request(c, r)["packages"])
+
+    def test_unknown_unsafe_or_foreign_installed_package_fails_clearly(self):
+        c = self.load()
+        for installed in (
+            ["unavailable-installed-app"],
+            ["app@public"],
+            ["opkg"],
+            ["kmod-mt76"],
+        ):
+            with self.subTest(installed=installed), self.assertRaises(PolicyError):
+                validate_request(
+                    c, {**self.request(c), "installed_packages": installed}
+                )
+
+    def test_collective_requested_installed_and_mandatory_bound_is_idempotent(self):
+        f = fixture()
+        for index in range(2048):
+            name = "optional-" + str(index)
+            f["packages"][name] = "1-r1"
+            f["package_identities"][name] = {
+                "name": name,
+                "abi": "",
+                "version": "1-r1",
+                "tag": "",
+            }
+        c = self.load(f)
+        request = self.request(c)
+        request["packages"] = ["optional-" + str(n) for n in range(1024)]
+        request["installed_packages"] = [
+            "optional-" + str(n) for n in range(1024, 2048)
+        ]
+        with self.assertRaisesRegex(PolicyError, "Combined installed/requested"):
+            validate_request(c, request)
+        request["packages"] = ["optional-" + str(n) for n in range(2040)]
+        request["installed_packages"] = []
+        request["packages_versions"] = {"optional-0": "1-r1"}
+        normalized = validate_request(c, request)
+        self.assertEqual(len(normalized["packages"]), 2048)
+        self.assertEqual(validate_request(c, normalized), normalized)
 
     def test_uninstalled_tailscale_denied(self):
         c = self.load()

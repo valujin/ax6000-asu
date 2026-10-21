@@ -15,6 +15,16 @@ def parse_manifest_text(content):
     return result
 
 
+def native_preflight_output(content, manager):
+    """Silent native make still emits APK's verified-bank success message."""
+    if manager != "apk":
+        return content
+    expected = "/builder/packages/packages.adb: OK"
+    lines = content.splitlines()
+    require(lines.count(expected) <= 1, "Duplicate native APK verification result")
+    return "\n".join(line for line in lines if line != expected)
+
+
 def verify_emitted_manifest(catalog, request, directory, preflight):
     files = sorted(Path(directory).glob("*.manifest"))
     require(

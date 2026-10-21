@@ -123,3 +123,61 @@ Actual SquashFS checks require exact native pins for installed policy roots,
 essential packages, the APK provider and all installed kmods. Every additional
 protected pin must match an approved native manifest identity/version and appear
 unchanged in world. Mandatory LuCI userspace does not become a core pin implicitly.
+
+## Frozen public APK candidates
+
+APK catalogs bind every approved package through two deduplicated tables:
+
+```json
+{
+  "apk_repositories": {
+    "native": {"url": "file:///builder/packages/packages.adb", "sha256": "SIGNED_INDEX_SHA256"},
+    "public-packages": {"url": "https://asu.example/immutable/SNAPSHOT/public/INDEX/packages/packages.adb", "sha256": "SIGNED_INDEX_SHA256"}
+  },
+  "package_origins": {
+    "example": {"repository": "public-packages", "filename": "example-1-r1.apk", "identity_sha256": "SIGNED_ADB_ROW_HASHES"}
+  },
+  "public_policy": {"mode": "candidates", "distribution": "immortalwrt", "tag": "public"}
+}
+```
+
+The frozen public catalog selects exactly one distribution: `immortalwrt` or
+`openwrt`. Promotion verifies every public repository belongs to that selection;
+mixed distribution catalogs are rejected. Native origin and ABI protections
+apply to both choices.
+
+Repository IDs are `native`, `supplement`, and `public-<feed>` for the approved
+base/luci/packages/routing/telephony/video feeds. Network indexes retain the
+signed snapshot identity in their immutable URLs. `identity_sha256` is the actual
+full SHA256 `hashes` value from the signed ADB package row, not a hash of JSON or
+the truncated hash exposed by some APK package-info views. Every package has
+exactly one approved origin. Protected native packages retain the native bank;
+approved noncore refreshes may use the signed supplement.
+
+`candidates` means eligible frozen metadata, with compatibility checked for each
+request. It does not assert that all candidates can be installed together.
+`validated-subset` retains the narrower promotion mode. Installed packages are
+validated and included in request roots even if a client omits them from the
+requested array; unavailable installed packages fail clearly. Installed Tailscale
+is preserved, while adding Tailscale to a device without it remains disallowed.
+The collective requested/installed/mandatory set is limited to 2048 packages.
+
+Before `make manifest` can download or unpack package payloads, the worker injects
+a trusted auxiliary make target. It includes the immutable native Makefile,
+executes its unchanged `_check_keys` and index-only `package_reload`, then uses
+the same root, cache, keys, repositories and APK executable. A real
+`add --simulate --no-scripts --no-commit-hooks --usermode` transaction checks
+conflicts; `query --recursive` alone ignores conflicts in the pinned APK version.
+Structured repository queries then prove complete names, versions, ABI identities
+and selected origins against SHA256/signature-verified frozen index rows. Any
+cached payload accepted by the proof must reproduce its full approved ADB identity.
+The native Makefile and frozen index bytes must remain unchanged.
+
+Signed index sizes limit the selected closure to 2 GiB installed and 512 MiB of
+archives before payload installation. Both the host output filesystem and actual
+builder filesystem must have 20 GiB free beyond projected staging
+(`2 * installed + 2 * archives + 1 GiB`); an initial host reserve check runs before
+the job starts. The installed manifest must exactly equal the admitted closure.
+Existing final manifest, actual image, overlay and partition-size checks still
+run before publication. No native source, profile or seed is changed by this
+temporary target, and no automatic ASU promotion timer is configured here.

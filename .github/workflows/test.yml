@@ -103,7 +103,7 @@ jobs:
       - name: Run AX6000 ASGI, policy, cache, engine and overlay tests
         run: |
           python .ci-recipes/packages612/scripts/hosted-publication.py -- \
-            env LD_LIBRARY_PATH="$ASU_CI_PYTHON_LIBRARY_PATH" "$RUNNER_TEMP/asu-ci-venv/bin/python" -m pytest -q tests/ax6000 \
+            env LD_LIBRARY_PATH="$ASU_CI_PYTHON_LIBRARY_PATH" APK="$RUNNER_TEMP/apk-host/build/src/apk" "$RUNNER_TEMP/asu-ci-venv/bin/python" -m pytest -q tests/ax6000 \
             --junitxml="$RUNNER_TEMP/ax6000-junit.xml"
       - name: Run operator tests with actual host signatures and APK metadata
         run: |
