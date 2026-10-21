@@ -11,7 +11,7 @@ x-api: &api
   cpus: 0.25
   restart: unless-stopped
   command: ["uvicorn", "asu.main:app", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers", "--forwarded-allow-ips", "*"]
-  tmpfs: [/tmp:size=32m,mode=1777]
+  tmpfs: ["/tmp:size=32m,mode=1777"]
   volumes:
     - ${ASU_STATE_DIR:?Set dedicated state directory}/catalogs:/catalogs:ro
     - ${ASU_STATE_DIR}/public:/public:ro
@@ -73,7 +73,7 @@ services:
       - ${ASU_STATE_DIR}/public:/public:rw
       - ${ASU_ROOTLESS_SOCKET:?Use dedicated rootless socket}:/run/ax6000-build/docker.sock:ro
       - /home/valuxin/dev/owrt/ax6000-packages-build/work/.build.lock:/build-lock/.build.lock:ro
-    tmpfs: [/tmp:size=64m,mode=1777]
+    tmpfs: ["/tmp:size=64m,mode=1777"]
     networks: [api]
     depends_on: [redis]
     logging: {driver: local, options: {max-size: 2m, max-file: "2"}}
