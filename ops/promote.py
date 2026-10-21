@@ -35,6 +35,10 @@ VENDOR = {'kmod-mt_wifi','kmod-mediatek_hnat','kmod-conninfra','kmod-warp','mtwi
           'ucode-mod-l1parser','wifi-dats','libiwinfo'}
 LAYOUTS = {'stock','mtkuboot','ubootmod'}
 PUBLIC_TAG = 'public'
+OPERATOR_PUBLISHER = {
+    'publish.py': (26070, '977e0eefa6acdc3eeb178b36de0ba719a0f8afe27576152dbb74a759c4988105'),
+    'package_format.py': (14099, '0ab7b8e010b3f81a64fb325ce3773f58a82f2195c29a1b4de7edb6d47eff0744'),
+}
 
 
 def require(ok, message):
@@ -111,6 +115,32 @@ def pinned_tool(path,pin):
     return path
 
 
+def reviewed_operator_publisher(directory,cohort):
+    """One literal operator source closure, separate from the native recipe."""
+    require(cohort in {'612-recommended','612-latest'},'Operator publisher is only for APK cohorts')
+    directory=Path(directory).absolute()
+    require(directory.is_dir() and not any(p.is_symlink() for p in (directory,*directory.parents)),
+            'Operator publisher directory is missing or linked')
+    require({p.name for p in directory.iterdir()}==set(OPERATOR_PUBLISHER),
+            'Operator publisher closure has an unexpected or missing sibling')
+    records={}
+    for name,(size,pin) in OPERATOR_PUBLISHER.items():
+        path=regular(directory/name,size)
+        require(path.stat().st_size==size and sha256(path)==pin,'Operator publisher source checksum differs')
+        records[name]={'path':str(path),'size':size,'sha256':pin}
+    # Both fixed files are loaded now, without creating an unapproved sibling.
+    # The publisher caches its format module, so subsequent validation needs no
+    # bytecode write and the caller's interpreter setting is restored.
+    previous=sys.dont_write_bytecode;sys.dont_write_bytecode=True
+    try:
+        publisher=load_module(directory/'publish.py','promote_operator_publisher')
+        publisher.package_format()
+    finally:sys.dont_write_bytecode=previous
+    publisher.asu_operator_publisher_scope={'role':'reviewed-operator-publisher',
+        'native_producer_replaced':False,'files':records}
+    return publisher
+
+
 def inventory(tree,exclude=()):
     tree=Path(tree);result=[];total=0
     require(tree.is_dir() and not tree.is_symlink(),'Expected a regular snapshot tree')
@@ -125,11 +155,12 @@ def inventory(tree,exclude=()):
     return result
 
 
-def snapshot_identity(snapshot,cohort,public_key,usign,recipe,apk=None):
+def snapshot_identity(snapshot,cohort,public_key,usign,recipe,apk=None,*,operator_publisher_dir=None):
     snapshot=Path(snapshot)
     channel=snapshot/'channel' if (snapshot/'channel').is_dir() else snapshot
     manifest=snapshot/'snapshot-manifest.json';signature=snapshot/'snapshot-manifest.sig'
-    publisher=load_module(recipe/'scripts/publish.py','promote_publisher')
+    publisher=(reviewed_operator_publisher(operator_publisher_dir,cohort) if operator_publisher_dir is not None
+               else load_module(recipe/'scripts/publish.py','promote_publisher'))
     subprocess.run([str(usign),'-V','-m',str(regular(manifest)),'-p',str(public_key),'-x',str(regular(signature))],
                    check=True,capture_output=True,timeout=30)
     proof=read_json(manifest);profile=read_json(channel/'profile.json')
@@ -154,6 +185,11 @@ def snapshot_identity(snapshot,cohort,public_key,usign,recipe,apk=None):
     else:
         require(profile.get('channel')==cohort.removeprefix('612-') and profile.get('package_manager')=='apk','Wrong APK snapshot cohort')
         validator=load_module(recipe/'scripts/channel-snapshot.py','promote_snapshot')
+        if operator_publisher_dir is not None:
+            # This fresh module alone uses the reviewed publisher. Every other
+            # helper still comes from the original, committed native recipe.
+            original_module=validator.module
+            validator.module=lambda name: publisher if name=='publish' else original_module(name)
         validator.validate_channel(channel,profile['channel'],profile['publication']['repository'],public_key,usign,apk=apk)
     return profile,channel,sha256(manifest),files,publisher
 
@@ -614,7 +650,9 @@ def promote(args):
                 'Production catalog key differs from the approved package recipe')
         source_profile=regular(args.source_profile)
         require(source_profile.is_relative_to(recipe/'profiles'),'Source profile must belong to the committed package recipe')
-        profile,channel,snapshot_sha,files,publisher=snapshot_identity(args.snapshot,args.cohort,public_key,usign,recipe,apk)
+        profile,channel,snapshot_sha,files,publisher=snapshot_identity(args.snapshot,args.cohort,public_key,usign,recipe,apk,
+            operator_publisher_dir=getattr(args,'operator_publisher_dir',None))
+        publisher_scope=getattr(publisher,'asu_operator_publisher_scope',None)
         require(regular(Path(args.raw)/'profile.json').read_bytes()==regular(channel/'profile.json').read_bytes(),
                 'Native RAW profile bytes differ from signed snapshot')
         importer=load_module(recipe/'scripts/import-release.py','promote_import')
@@ -729,6 +767,8 @@ def promote(args):
                 feed_receipt['hosted_context']=hosted.scope
             if accepted_native is not None:
                 feed_receipt['native_acceptance']=accepted_native
+            if publisher_scope is not None:
+                feed_receipt['operator_publisher']=publisher_scope
             feed_bytes=canonical(feed_receipt)
             data={'schema_version':1,'cohort':args.cohort,'build_id':profile['build_id'],'source_commit':profile['firmware']['commit'],
                   'seed':profile['asu']['seed'],'snapshot_sha256':snapshot_sha,'package_manager':'opkg' if args.cohort=='66' else 'apk',
@@ -773,6 +813,8 @@ def promote(args):
                     audit['hosted_context']=hosted.scope
                 if accepted_native is not None:
                     audit['native_acceptance']=accepted_native
+                if publisher_scope is not None:
+                    audit['operator_publisher']=publisher_scope
                 write_new(ready/'promotion.json',canonical(audit));ready.chmod(0o555);rename_new(ready,output)
     return {'catalog':str(output/'catalog.json'),'catalog_sha256':catalog_sha,'snapshot_sha256':snapshot_sha,'service_activated':False}
 
@@ -787,6 +829,8 @@ def main(argv=None):
                  'builder-load-receipt-sha256','usign-sha256','site-url'):
         parser.add_argument('--'+name,required=True)
     parser.add_argument('--apk',type=Path);parser.add_argument('--apk-sha256');parser.add_argument('--apk-public-key',type=Path)
+    parser.add_argument('--operator-publisher-dir',type=Path,
+                        help='Explicit two-file reviewed APK publisher handoff; native recipe provenance is retained')
     context=parser.add_mutually_exclusive_group(required=True)
     context.add_argument('--source',type=Path)
     context.add_argument('--hosted-context',type=Path)

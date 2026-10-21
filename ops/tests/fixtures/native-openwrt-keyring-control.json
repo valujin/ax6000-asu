@@ -1,0 +1,38 @@
+{
+  "control": {
+    "APK-Name": "openwrt-keyring",
+    "APK-Raw": {
+      "arch": "aarch64_cortex-a53",
+      "depends": [
+        "libc"
+      ],
+      "description": "The keyring of with the developer using and gpg public keys.",
+      "hashes": "d6da21c32c713fcf171b1a838e0642c2653765a1",
+      "installed-size": 424,
+      "license": "GPL-2.0",
+      "maintainer": "John Crispin <john@phrozen.org>",
+      "name": "openwrt-keyring",
+      "origin": "feeds/base/system/openwrt-keyring",
+      "provides": [
+        "lede-keyring=2025.12.11~14e1f88b-r1",
+        "openwrt-keyring-any"
+      ],
+      "url": "https://openwrt.org/docs/guide-user/security/signatures",
+      "version": "2025.12.11~14e1f88b-r1"
+    },
+    "Architecture": "aarch64_cortex-a53",
+    "Base-Package": "openwrt-keyring",
+    "Depends": "libc",
+    "Description": "The keyring of with the developer using and gpg public keys.",
+    "Installed-Size": "424",
+    "License": "GPL-2.0",
+    "Maintainer": "John Crispin <john@phrozen.org>",
+    "Package": "openwrt-keyring",
+    "Provides": "lede-keyring (= 2025.12.11~14e1f88b-r1), openwrt-keyring-any",
+    "Source": "feeds/base/system/openwrt-keyring",
+    "URL": "https://openwrt.org/docs/guide-user/security/signatures",
+    "Version": "2025.12.11~14e1f88b-r1"
+  },
+  "kind": "actual-accepted-native-openwrt-keyring-control",
+  "source_diagnosis_sha256": "db2fe8a05be84f22300a719c71a1e2c4149d6a8d73be976afa6fa6e3156536e5"
+}

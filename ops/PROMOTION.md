@@ -17,6 +17,20 @@ Run it only after independent verification of the actual native firmware, real I
 
 Native core recipe roots, manager, vendor/ASU packages, their installed dependency closure and every native kmod remain protected. Supplemental packages may update approved user applications. Native installed manifests are checked against the original native bank before merging daily updates; default package names then use the approved merged versions, so a newer PBR release does not invalidate its original native manifest. Protected native archives must retain their exact native bytes. Canonical identities preserve actual package names and only their declared ABI suffixes in both APK and OPKG, including native suffixes such as `-0`. Packages without a declared suffix use an empty suffix. Tailscale remains outside mandatory/default images.
 
+For an APK snapshot whose frozen native recipe predates the reviewed
+`openwrt-keyring` compatibility provider fix, explicitly supply
+`--operator-publisher-dir /trusted/reviewed-publisher`. This directory must contain
+only the exact reviewed `publish.py` (26070 bytes, SHA256
+`977e0eefa6acdc3eeb178b36de0ba719a0f8afe27576152dbb74a759c4988105`)
+and `package_format.py` (14099 bytes, SHA256
+`0ab7b8e010b3f81a64fb325ce3773f58a82f2195c29a1b4de7edb6d47eff0744`).
+Linked, missing, changed or extra files are rejected. Only the fresh snapshot
+validator's publisher lookup uses this handoff; its remaining helpers and full
+validation still use the committed native recipe. Native source, producer and
+recipe provenance remain unchanged. `feed-evidence.json` and `promotion.json`
+record the separate `operator_publisher` role and exact two-file closure. Omitting
+the option retains the original recipe publisher. The option is rejected for 6.6.
+
 ## Native root filesystem overlay
 
 Standard ImageBuilder archives do not include the native source's `files/` directory. Promotion therefore adds a required, trusted `rootfs_overlay` to the catalog. Each exact path maps to `{content_base64, sha256, mode}`, with canonical base64, SHA256 and integer mode 0644 or 0755. The worker materializes these files through its own `FILES` directory, then writes the complete catalog identity to `etc/asu-cohort.json`. Client requests cannot supply or change this overlay.
