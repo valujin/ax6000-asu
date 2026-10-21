@@ -9,7 +9,10 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import re
+import resource
 import secrets
+import selectors
+import signal
 import subprocess
 import tarfile
 import tempfile
@@ -20,6 +23,7 @@ LOCK = '/home/valuxin/dev/owrt/ax6000-packages-build/work/.build.lock'
 MIB = 1024**2
 LABEL = 'io.valujin.ax6000-asu.operator-smoke'
 MEMORY = 10 * 1024**3
+DOCKER_ENV_KEYS = ('DOCKER_HOST', 'DOCKER_CONTEXT', 'DOCKER_TLS_VERIFY', 'DOCKER_CERT_PATH', 'DOCKER_CONFIG', 'DOCKER_API_VERSION')
 HOLDER = ['timeout', '--foreground', '--kill-after=10s', '1200', 'flock', '-x', '/build-lock/.build.lock',
           '/bin/sh', '-ec', 'printf %s "$ASU_LOCK_TOKEN" > /builder/.smoke-lock-held; exec sleep 86400']
 CAP_SCRIPT = r'''set -eu
@@ -84,20 +88,61 @@ def native_source_file(recorded, prefix, source, checksum, *, required_relative=
                     'actual_path': str(actual), 'sha256': checksum}
 
 
-def make_command(operation, layout, packages):
+def package_selection(info, layout, packages):
+    """Retain actual native names; explicitly remove unwanted inherited defaults."""
+    require(layout in ('stock', 'mtkuboot', 'ubootmod') and isinstance(info, str) and info,
+            'Successful matching make info is required before package selection')
+    desired = set(packages)
+    require(desired and 'tailscale' not in desired and all(builder.NAME.fullmatch(name) for name in desired),
+            'Unsafe actual native package selection')
+    lines = info.splitlines()
+    targets = [line for line in lines if line.startswith('Current Target:')]
+    require(targets == ['Current Target: "mediatek/filogic"'] and lines.count('Available Profiles:') == 1,
+            'Make info target/profile overview is missing or ambiguous')
+    default_lines = [line for line in lines if line.startswith('Default Packages:')]
+    require(len(default_lines) == 1 and default_lines[0].startswith('Default Packages: '),
+            'Make info default packages are missing or ambiguous')
+    device = 'xiaomi_redmi-router-ax6000-' + layout
+    require(lines.count(device + ':') == 1, 'Make info selected profile is missing or ambiguous')
+    index = lines.index(device + ':')
+    require(lines.index('Available Profiles:') < index, 'Make info selected profile is outside the overview')
+    block = []
+    for line in lines[index + 1:]:
+        if not line.startswith('    '):
+            break
+        block.append(line)
+    profile_lines = [line for line in block if line.startswith('    Packages:')]
+    supported = [line for line in block if line.startswith('    SupportedDevices: ')]
+    require(len(profile_lines) == 1 and profile_lines[0].startswith('    Packages: ')
+            and len(supported) == 1 and 'xiaomi,redmi-router-ax6000-' + layout in supported[0].split()[1:],
+            'Make info selected profile packages/device are missing or ambiguous')
+    default_packages = default_lines[0].removeprefix('Default Packages: ').split()
+    profile_packages = profile_lines[0].removeprefix('    Packages: ').split()
+    require(default_packages and all(builder.NAME.fullmatch(name) for name in default_packages + profile_packages),
+            'Unsafe inherited ImageBuilder package name')
+    excluded = (set(default_packages) | set(profile_packages)) - desired | {'tailscale'}
+    return {'profile': device, 'default_packages': sorted(set(default_packages)),
+            'profile_packages': sorted(set(profile_packages)), 'desired_packages': sorted(desired),
+            'excluded_packages': sorted(excluded),
+            'package_specs': ['-' + name for name in sorted(excluded)] + sorted(desired)}
+
+
+def make_command(operation, layout, packages, *, info=None):
     require(operation in ('info', 'manifest', 'image') and layout in ('stock', 'mtkuboot', 'ubootmod'), 'Invalid smoke operation/layout')
     require(packages and all(builder.NAME.fullmatch(name) for name in packages), 'Unsafe actual package name')
     command = ['nice', '-n', '19', 'ionice', '-c', '3', 'make', '-s', operation]
     if operation != 'info':
+        selection = package_selection(info, layout, packages)
         command += ['PROFILE=xiaomi_redmi-router-ax6000-' + layout,
-                    'PACKAGES=' + ' '.join(sorted(set(packages))) + ' -tailscale']
+                    'PACKAGES=' + ' '.join(selection['package_specs'])]
     if operation == 'image':
         command += ['FILES=/builder/smoke-files', 'BIN_DIR=/builder/smoke-out']
     return command
 
 
-def validate_manifest(actual, defaults, controls, kernel, manager):
+def validate_manifest(actual, defaults, controls, kernel, manager, *, excluded=()):
     require(actual and set(defaults) <= set(actual) and 'tailscale' not in actual, 'Smoke manifest drops native defaults or adds Tailscale')
+    require(not set(excluded).intersection(actual), 'Smoke manifest reintroduces excluded ImageBuilder defaults')
     for name, version in actual.items():
         require(name in controls and controls[name]['Version'] == version, 'Unapproved emitted package/version: ' + name)
     require(actual.get('kernel') == kernel, 'Emitted kernel ABI differs')
@@ -155,15 +200,79 @@ def client_command(arguments, asset=None):
     return command + [builder.BASE_IMAGE, '-ec', builder.CLIENT_GUARD, '--', builder.ROOTLESS_ENGINE, *arguments]
 
 
-def client(arguments, verifier, destination=None, cap=8 * MIB, timeout=120, asset=None):
-    env_keys = ('DOCKER_HOST', 'DOCKER_CONTEXT', 'DOCKER_TLS_VERIFY', 'DOCKER_CERT_PATH', 'DOCKER_CONFIG', 'DOCKER_API_VERSION')
-    # Native bounded runner inherits our environment; no ambient host/context can
-    # redirect explicit sockets. Remove only during this synchronous invocation.
-    previous = {key: os.environ.pop(key) for key in env_keys if key in os.environ}
+def client_limits():
+    # Go's Docker CLI reserves more virtual address space than native inspectors.
+    resource.setrlimit(resource.RLIMIT_AS, (2 * 1024**3, 2 * 1024**3))
+    resource.setrlimit(resource.RLIMIT_CPU, (600, 600))
+    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+    os.sched_setaffinity(0, {min(os.sched_getaffinity(0))})
+
+
+def run_client_bounded(command, cap, *, timeout=120, destination=None, stderr_cap=256 * 1024, env=None):
+    """Stream operator CLI output with independent stdout/stderr and time bounds."""
+    require(cap > 0 and stderr_cap > 0 and timeout > 0, 'Invalid Docker client bounds')
+    output = Path(destination).open('xb') if destination is not None else io.BytesIO()
+    errors, count, process, succeeded = bytearray(), 0, None, False
+    selector = selectors.DefaultSelector()
+
+    def failure(message):
+        detail = bytes(errors[:4096]).decode('utf-8', errors='replace').strip()
+        return ValueError(message + (': ' + detail if detail else ''))
+
     try:
-        return verifier.run_bounded(client_command(arguments, asset), cap, timeout=timeout, destination=destination)
+        process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                   env=env, preexec_fn=client_limits, start_new_session=True)
+        selector.register(process.stdout, selectors.EVENT_READ, 'stdout')
+        selector.register(process.stderr, selectors.EVENT_READ, 'stderr')
+        deadline = time.monotonic() + timeout
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise failure('Docker client timeout')
+            for key, _ in selector.select(min(0.2, remaining)):
+                is_stdout = key.data == 'stdout'
+                remaining_cap = cap - count if is_stdout else stderr_cap - len(errors)
+                chunk = os.read(key.fd, min(64 * 1024, remaining_cap + 1))
+                if not chunk:
+                    selector.unregister(key.fileobj)
+                    continue
+                if len(chunk) > remaining_cap:
+                    if not is_stdout:
+                        errors.extend(chunk[:remaining_cap])
+                    raise failure('Docker client ' + key.data + ' byte cap exceeded')
+                if is_stdout:
+                    output.write(chunk)
+                    count += len(chunk)
+                else:
+                    errors.extend(chunk)
+        try:
+            code = process.wait(timeout=max(0.001, deadline - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            raise failure('Docker client timeout') from None
+        if code != 0:
+            raise failure('Docker client failed with exit ' + str(code))
+        succeeded = True
+        return count if destination is not None else output.getvalue()
     finally:
-        os.environ.update(previous)
+        selector.close()
+        if process is not None:
+            # Also stop inherited-pipe descendants on timeout/output-limit errors.
+            if not succeeded:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            process.wait()
+            process.stdout.close()
+            process.stderr.close()
+        output.close()
+
+
+def client(arguments, verifier, destination=None, cap=8 * MIB, timeout=120, asset=None):
+    # Keep the native verifier's 512 MiB inspection limits unchanged. Only the
+    # explicit operator Docker argv uses this Go-compatible bounded runner.
+    env = {key: value for key, value in os.environ.items() if key not in DOCKER_ENV_KEYS}
+    return run_client_bounded(client_command(arguments, asset), cap, timeout=timeout, destination=destination, env=env)
 
 
 def container_command(image_id, token):
@@ -332,7 +441,7 @@ def prepare_native(args, context, recipe):
     return context
 
 
-def inspect_artifacts(layout, directory, context, receipt_parent):
+def inspect_artifacts(layout, directory, context, receipt_parent, selection):
     verifier, profile, native = context['verifier'], context['profile'], context['native']
     artifacts = directory / 'artifacts'
     overview = promotion.read_json(artifacts / 'profiles.json')
@@ -349,7 +458,8 @@ def inspect_artifacts(layout, directory, context, receipt_parent):
     require(len(manifests) == 1, 'Expected exactly one actual emitted image manifest')
     actual = verifier.device_manifest(manifests[0])
     preflight = verifier.device_manifest(directory / 'manifest.txt')
-    validate_manifest(actual, context['defaults'][layout], context['controls'], profile['firmware']['kernel_version'], profile.get('package_manager', 'opkg'))
+    validate_manifest(actual, context['defaults'][layout], context['controls'], profile['firmware']['kernel_version'],
+                      profile.get('package_manager', 'opkg'), excluded=selection['excluded_packages'])
     require(actual == preflight, 'Actual emitted image manifest differs from preflight')
     metadata_path, stripped = directory / 'fwtool.json', directory / 'stripped-image'
     original_sha = builder.sha256(image)
@@ -384,6 +494,7 @@ def inspect_artifacts(layout, directory, context, receipt_parent):
             'info': record(directory / 'info.txt', receipt_parent), 'manifest': record(manifests[0], receipt_parent),
             'image': record(image, receipt_parent), 'metadata': record(metadata_path, receipt_parent),
             'kernel_sha256': kernel['sha256'], 'profiles': record(artifacts / 'profiles.json', receipt_parent),
+            'package_selection': record(directory / 'package-selection.json', receipt_parent),
             'root_inspection': record(directory / 'root-inspection.json', receipt_parent)}
 
 
@@ -407,26 +518,33 @@ def run_layout(layout, output, args, context, lock_stat):
         client(['container', 'exec', '--user=1000:1000', created, 'mkdir', '-p', '/builder/smoke-files', '/builder/smoke-logs'], verifier)
         client(['container', 'cp', '/assets/input.tar', created + ':/builder/smoke-overlay.tar'], verifier, asset=overlay_file)
         client(['container', 'exec', '--user=1000:1000', created, 'tar', '-xf', '/builder/smoke-overlay.tar', '-C', '/builder/smoke-files'], verifier)
+        info, selection = None, None
         for operation in ('info', 'manifest', 'image'):
             command = ['container', 'exec', '--user=1000:1000', '--workdir=/builder', created,
                        '/bin/sh', '-ec', 'err=$1; shift; exec "$@" 2> "$err"', '--',
                        '/builder/smoke-logs/' + operation + '.stderr',
-                       *make_command(operation, layout, context['defaults'][layout])]
+                       *make_command(operation, layout, context['defaults'][layout], info=info)]
             try:
                 client(command, verifier, destination=directory / (operation + '.txt'), cap=64 * MIB, timeout=1150)
             finally:
                 client(['container', 'exec', '--user=1000:1000', created, 'cat', '/builder/smoke-logs/' + operation + '.stderr'],
                        verifier, destination=directory / (operation + '.stderr'), cap=64 * MIB)
             if operation == 'info':
-                require(('xiaomi_redmi-router-ax6000-' + layout) in (directory / 'info.txt').read_text(), 'Actual make info omits layout')
+                info = (directory / 'info.txt').read_text()
+                selection = package_selection(info, layout, context['defaults'][layout])
+                selection_record = {**selection, 'info': record(directory / 'info.txt', output),
+                                    'commands': {op: make_command(op, layout, context['defaults'][layout], info=info)
+                                                 for op in ('manifest', 'image')}}
+                (directory / 'package-selection.json').write_text(json.dumps(selection_record, indent=2, sort_keys=True) + '\n')
             if operation == 'manifest':
                 preflight = verifier.device_manifest(directory / 'manifest.txt')
-                validate_manifest(preflight, context['defaults'][layout], context['controls'], context['profile']['firmware']['kernel_version'], context['profile'].get('package_manager', 'opkg'))
+                validate_manifest(preflight, context['defaults'][layout], context['controls'], context['profile']['firmware']['kernel_version'],
+                                  context['profile'].get('package_manager', 'opkg'), excluded=selection['excluded_packages'])
         exported = directory / 'outputs.tar'
         client(['container', 'cp', created + ':/builder/smoke-out/.', '-'], verifier,
                destination=exported, cap=1024**3 + MIB, timeout=120)
         unpack_outputs(exported, directory / 'artifacts')
-        return inspect_artifacts(layout, directory, context, output)
+        return inspect_artifacts(layout, directory, context, output, selection)
     finally:
         # Delete only this newly created ID; never reap other native/ASU containers.
         client(['container', 'rm', '--force', created], verifier)
@@ -459,8 +577,10 @@ def main(argv=None):
                     'archive_sha256': args.archive_sha256, 'attestation_sha256': context['approval']['attestation_sha256'],
                     'snapshot_sha256': args.snapshot_sha256, 'overlay_paths': sorted(context['overlay']),
                     'native_source_mapping': context['native_source_mapping'],
-                    'layouts': {layout: {operation: make_command(operation, layout, packages)
-                                        for operation in ('info', 'manifest', 'image')}
+                    'layouts': {layout: {'info': make_command('info', layout, packages),
+                                        'desired_packages': sorted(packages),
+                                        'pending_operations': ['manifest', 'image'],
+                                        'package_selection': 'Requires successful matching make info; exclude inherited defaults absent from desired packages'}
                                 for layout, packages in context['defaults'].items()}}
             if not args.run:
                 print(json.dumps(plan, indent=2, sort_keys=True))

@@ -5,7 +5,11 @@ import hashlib
 import importlib.util
 import io
 import json
+import os
 from pathlib import Path
+import resource
+import subprocess
+import sys
 import tarfile
 import tempfile
 from types import SimpleNamespace
@@ -15,6 +19,26 @@ from unittest.mock import patch
 SPEC = importlib.util.spec_from_file_location('smoke_imagebuilder', Path(__file__).parents[1] / 'smoke_imagebuilder.py')
 smoke = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(smoke)
+
+# Exact selected-profile/header format from the real 6.6 `make info` log;
+# unrelated profiles and the large desired package set below are synthetic.
+MAKE_INFO = '''Current Target: "mediatek/filogic"
+Current Architecture: "aarch64"
+Current Revision: "r0+33648-ec9ef10efc"
+Default Packages: base-files libc libgcc libustream-openssl wpad-openssl nftables opkg
+Available Profiles:
+
+unrelated_profile:
+    Unrelated synthetic device
+    Packages: unrelated-package
+    hasImageMetadata: 1
+    SupportedDevices: unrelated,device
+xiaomi_redmi-router-ax6000-stock:
+    Xiaomi Redmi Router AX6000 (stock layout)
+    Packages: kmod-leds-ws2812b kmod-mt7915e kmod-mt7986-firmware mt7986-wo-firmware
+    hasImageMetadata: 1
+    SupportedDevices: xiaomi,redmi-router-ax6000-stock
+'''
 
 
 class SmokeRunnerTests(unittest.TestCase):
@@ -29,14 +53,50 @@ class SmokeRunnerTests(unittest.TestCase):
         self.defaults = {name: item['Version'] for name, item in self.controls.items()}
 
     def test_make_argv_preserves_actual_names_and_omits_strip_abi(self):
-        command = smoke.make_command('manifest', 'stock', self.defaults)
+        command = smoke.make_command('manifest', 'stock', self.defaults, info=MAKE_INFO)
         self.assertEqual(command[:8], ['nice', '-n', '19', 'ionice', '-c', '3', 'make', '-s'])
         self.assertIn('PROFILE=xiaomi_redmi-router-ax6000-stock', command)
         self.assertTrue(any('libubox2026' in part and part.startswith('PACKAGES=') for part in command))
         self.assertFalse(any('STRIP_ABI' in part for part in command))
-        self.assertIn('FILES=/builder/smoke-files', smoke.make_command('image', 'stock', self.defaults))
+        self.assertIn('FILES=/builder/smoke-files', smoke.make_command('image', 'stock', self.defaults, info=MAKE_INFO))
         with self.assertRaises(ValueError):
             smoke.make_command('image', 'stock', ['busybox;touch /tmp/unsafe'])
+
+    def test_make_info_diff_keeps_all_407_desired_names_and_removes_inherited_extras(self):
+        desired = {'base-files', 'libc', 'libgcc1', 'libustream-mbedtls20201210',
+                   'wpad-mbedtls', 'nftables-json', 'opkg', 'kmod-mt_wifi'}
+        desired.update('synthetic-native-' + str(i) for i in range(407 - len(desired)))
+        selection = smoke.package_selection(MAKE_INFO, 'stock', desired)
+        specs = selection['package_specs']
+        self.assertEqual({name for name in specs if not name.startswith('-')}, desired)
+        self.assertEqual(len([name for name in specs if not name.startswith('-')]), 407)
+        self.assertEqual(set(selection['excluded_packages']), {'libgcc', 'nftables', 'libustream-openssl',
+                         'wpad-openssl', 'kmod-leds-ws2812b', 'kmod-mt7915e', 'kmod-mt7986-firmware',
+                         'mt7986-wo-firmware', 'tailscale'})
+        self.assertFalse(any('unrelated-package' in spec for spec in specs))
+        argv = smoke.make_command('manifest', 'stock', desired, info=MAKE_INFO)
+        self.assertEqual(next(arg.removeprefix('PACKAGES=') for arg in argv if arg.startswith('PACKAGES=')).split(), specs)
+        # The diff follows actual info, including the inverse SSL choice.
+        desired = desired - {'libustream-mbedtls20201210', 'wpad-mbedtls'} | {'libustream-openssl', 'wpad-openssl'}
+        info = MAKE_INFO.replace('libustream-openssl wpad-openssl', 'libustream-mbedtls wpad-basic-mbedtls')
+        excluded = smoke.package_selection(info, 'stock', desired)['excluded_packages']
+        self.assertIn('libustream-mbedtls', excluded)
+        self.assertIn('wpad-basic-mbedtls', excluded)
+        self.assertNotIn('libustream-openssl', excluded)
+
+    def test_package_selection_requires_unambiguous_matching_make_info(self):
+        invalid = [None, '', MAKE_INFO.replace('mediatek/filogic', 'wrong/target'),
+                   MAKE_INFO.replace('Default Packages:', 'Missing Defaults:'),
+                   MAKE_INFO.replace('xiaomi_redmi-router-ax6000-stock:', 'xiaomi_redmi-router-ax6000-ubootmod:'),
+                   MAKE_INFO + MAKE_INFO, MAKE_INFO.replace('    Packages: kmod-leds', '    WrongField: kmod-leds'),
+                   MAKE_INFO + MAKE_INFO[MAKE_INFO.index('xiaomi_redmi-router-ax6000-stock:'):],
+                   MAKE_INFO.replace('libgcc libustream', 'libgcc;touch libustream'),
+                   MAKE_INFO.replace('xiaomi,redmi-router-ax6000-stock', 'xiaomi,wrong-device')]
+        for info in invalid:
+            with self.subTest(info=info), self.assertRaises(ValueError):
+                smoke.make_command('manifest', 'stock', self.defaults, info=info)
+        with self.assertRaises(ValueError):
+            smoke.make_command('image', 'stock', self.defaults)
 
     def test_container_proof_namespace_maps_to_pinned_host_source_files(self):
         source = self.root / 'host-source'
@@ -100,6 +160,44 @@ class SmokeRunnerTests(unittest.TestCase):
                        self.defaults | {'tailscale': '1'}]:
             with self.assertRaises(ValueError):
                 smoke.validate_manifest(actual, self.defaults, self.controls, self.profile['firmware']['kernel_version'], 'opkg')
+        controls = self.controls | {'libustream-openssl': {'Version': '1'}}
+        with self.assertRaisesRegex(ValueError, 'reintroduces excluded'):
+            smoke.validate_manifest(self.defaults | {'libustream-openssl': '1'}, self.defaults, controls,
+                                    self.profile['firmware']['kernel_version'], 'opkg', excluded=['libustream-openssl'])
+
+    def test_run_layout_uses_successful_info_for_manifest_and_image_selection(self):
+        observed = []
+        container_id = 'c' * 64
+        def fake_client(arguments, verifier, **kwargs):
+            if arguments[:2] == ['container', 'create']:
+                return container_id.encode()
+            if arguments[:2] == ['container', 'inspect']:
+                return b'[{}]'
+            if smoke.CAP_SCRIPT in arguments:
+                return self.caps().encode()
+            destination = kwargs.get('destination')
+            if 'make' in arguments:
+                observed.append(arguments)
+                destination.write_text(MAKE_INFO if 'info' in arguments else 'synthetic output')
+            elif destination:
+                destination.write_bytes(b'')
+            return b''
+        context = self.context() | {'verifier': SimpleNamespace(device_manifest=lambda path: self.defaults),
+                                    'controls': self.controls, 'overlay': {}}
+        with patch.object(smoke, 'client', side_effect=fake_client), patch.object(smoke, 'assert_container'), \
+             patch.object(smoke, 'wait_lock'), patch.object(smoke, 'unpack_outputs'), \
+             patch.object(smoke, 'inspect_artifacts', return_value={'synthetic': True}) as inspect:
+            smoke.run_layout('stock', self.root, SimpleNamespace(image_id='sha256:' + 'a' * 64), context, object())
+        self.assertEqual(len(observed), 3)
+        selection = json.loads((self.root / 'stock/package-selection.json').read_text())
+        self.assertEqual(selection['info']['sha256'], hashlib.sha256(MAKE_INFO.encode()).hexdigest())
+        for arguments in observed[1:]:
+            specs = next(arg.removeprefix('PACKAGES=') for arg in arguments if arg.startswith('PACKAGES=')).split()
+            self.assertIn('-kmod-mt7915e', specs)
+            self.assertIn('-kmod-mt7986-firmware', specs)
+            self.assertIn('-mt7986-wo-firmware', specs)
+            self.assertEqual({name for name in specs if not name.startswith('-')}, set(self.defaults))
+        self.assertEqual(inspect.call_args.args[-1]['package_specs'], selection['package_specs'])
 
     def caps(self):
         return ('cpu.max=400000 100000\ncpuset.cpus.effective=0-3\nmemory.max=10737418240\n'
@@ -144,6 +242,60 @@ class SmokeRunnerTests(unittest.TestCase):
         self.assertIn('--user=2000:2000', command)
         self.assertIn('--memory=2g', command)
         self.assertIn('--memory-swap=2g', command)
+
+    def test_client_runner_streams_stdout_and_bounds_capture(self):
+        command = [sys.executable, '-c', 'import os; os.write(1,b"x"*10000); os.write(2,b"diagnostic")']
+        self.assertEqual(smoke.run_client_bounded(command, 10000), b'x' * 10000)
+        target = self.root / 'stdout.bin'
+        self.assertEqual(smoke.run_client_bounded(command, 10000, destination=target), 10000)
+        self.assertEqual(target.read_bytes(), b'x' * 10000)
+        with self.assertRaisesRegex(ValueError, 'stdout byte cap'):
+            smoke.run_client_bounded(command, 9999, destination=self.root / 'capped.bin')
+        self.assertLessEqual((self.root / 'capped.bin').stat().st_size, 9999)
+        with self.assertRaises(FileExistsError):
+            smoke.run_client_bounded(command, 10000, destination=target)
+
+    def test_client_runner_bounds_stderr_and_reports_nonzero_diagnostic(self):
+        with self.assertRaisesRegex(ValueError, 'exit 7.*synthetic failure'):
+            smoke.run_client_bounded([sys.executable, '-c', 'import os; os.write(2,b"synthetic failure"); exit(7)'], 128)
+        with self.assertRaisesRegex(ValueError, 'stderr byte cap'):
+            smoke.run_client_bounded([sys.executable, '-c', 'import os; os.write(2,b"e"*10000)'],
+                                     128, stderr_cap=9999)
+
+    def test_client_runner_times_out_silent_or_closed_streams(self):
+        for code in ['import time; time.sleep(5)',
+                     'import os,time; os.close(1); os.close(2); time.sleep(5)']:
+            with self.subTest(code=code), self.assertRaisesRegex(ValueError, 'timeout'):
+                smoke.run_client_bounded([sys.executable, '-c', code], 128, timeout=0.1)
+
+    def test_client_runner_limits_and_docker_environment_are_local(self):
+        command = [sys.executable, '-c', 'import json,os,resource; print(json.dumps({'
+                   '"as":resource.getrlimit(resource.RLIMIT_AS),"cpu":resource.getrlimit(resource.RLIMIT_CPU),'
+                   '"affinity":list(os.sched_getaffinity(0))}))']
+        observed = json.loads(smoke.run_client_bounded(command, 4096))
+        self.assertEqual(observed['as'], [2 * 1024**3] * 2)
+        self.assertEqual(observed['cpu'], [600, 600])
+        self.assertEqual(observed['affinity'], [min(os.sched_getaffinity(0))])
+        verifier = SimpleNamespace(run_bounded=lambda *a, **kw: self.fail('native runner used for Docker'))
+        dirty = {key: 'ambient-untrusted' for key in smoke.DOCKER_ENV_KEYS}
+        with patch.dict(os.environ, dirty), patch.object(smoke, 'run_client_bounded', return_value=b'{}') as bounded:
+            self.assertEqual(smoke.client(['info'], verifier), b'{}')
+            argv, cap = bounded.call_args.args
+            self.assertEqual(argv, smoke.client_command(['info']))
+            self.assertEqual(cap, 8 * smoke.MIB)
+            self.assertFalse(set(smoke.DOCKER_ENV_KEYS) & bounded.call_args.kwargs['env'].keys())
+            self.assertTrue(all(os.environ[key] == value for key, value in dirty.items()))
+
+    @unittest.skipUnless(Path('/usr/bin/docker').is_file(), 'actual Docker CLI unavailable')
+    def test_actual_docker_version_needs_go_address_space_without_daemon_access(self):
+        def old_limit():
+            resource.setrlimit(resource.RLIMIT_AS, (512 * smoke.MIB, 512 * smoke.MIB))
+            resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+        old = subprocess.run(['/usr/bin/docker', '--version'], capture_output=True, timeout=10, preexec_fn=old_limit)
+        self.assertNotEqual(old.returncode, 0)
+        self.assertIn(b'failed to reserve page summary memory', old.stderr)
+        actual = smoke.run_client_bounded(['/usr/bin/docker', '--version'], 4096, timeout=10)
+        self.assertIn(b'Docker version', actual)
 
     def test_nonce_and_actual_inode_are_required_before_make(self):
         state = json.dumps([{'State': {'Running': True}}]).encode()
