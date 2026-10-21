@@ -167,12 +167,14 @@ class SmokeRunnerTests(unittest.TestCase):
 
     def test_run_layout_uses_successful_info_for_manifest_and_image_selection(self):
         observed = []
+        lock = self.root / "fixture-build.lock"
+        lock.touch()
         container_id = 'c' * 64
         def fake_client(arguments, verifier, **kwargs):
             if arguments[:2] == ['container', 'create']:
                 return container_id.encode()
             if arguments[:2] == ['container', 'inspect']:
-                return b'[{}]'
+                return json.dumps([{'Id': container_id, 'State': {'Running': False}}]).encode()
             if smoke.CAP_SCRIPT in arguments:
                 return self.caps().encode()
             destination = kwargs.get('destination')
@@ -184,10 +186,10 @@ class SmokeRunnerTests(unittest.TestCase):
             return b''
         context = self.context() | {'verifier': SimpleNamespace(device_manifest=lambda path: self.defaults),
                                     'controls': self.controls, 'overlay': {}}
-        with patch.object(smoke, 'client', side_effect=fake_client), patch.object(smoke, 'assert_container'), \
+        with patch.object(smoke, 'LOCK', str(lock)), patch.object(smoke, 'client', side_effect=fake_client), patch.object(smoke, 'assert_container'), \
              patch.object(smoke, 'wait_lock'), patch.object(smoke, 'unpack_outputs'), \
              patch.object(smoke, 'inspect_artifacts', return_value={'synthetic': True}) as inspect:
-            smoke.run_layout('stock', self.root, SimpleNamespace(image_id='sha256:' + 'a' * 64), context, object())
+            smoke.run_layout('stock', self.root, SimpleNamespace(image_id='sha256:' + 'a' * 64), context, lock.stat())
         self.assertEqual(len(observed), 3)
         selection = json.loads((self.root / 'stock/package-selection.json').read_text())
         self.assertEqual(selection['info']['sha256'], hashlib.sha256(MAKE_INFO.encode()).hexdigest())

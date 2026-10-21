@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Operator-only native ImageBuilder smoke; dry validated plan unless --run."""
 import argparse
+import fcntl
 import base64
 import hashlib
 import importlib.util
@@ -576,11 +577,22 @@ def run_layout(layout, output, args, context, lock_stat):
                 preflight = verifier.device_manifest(directory / 'manifest.txt')
                 validate_manifest(preflight, context['defaults'][layout], context['controls'], context['profile']['firmware']['kernel_version'],
                                   context['profile'].get('package_manager', 'opkg'), excluded=selection['excluded_packages'])
-        exported = directory / 'outputs.tar'
-        client(['container', 'cp', created + ':/builder/smoke-out/.', '-'], verifier,
-               destination=exported, cap=1024**3 + MIB, timeout=120)
-        unpack_outputs(exported, directory / 'artifacts')
-        return inspect_artifacts(layout, directory, context, output, selection)
+        # Stop only this owned container after all real make operations. The
+        # PID1 timeout must not release GLOBAL during host export/inspection.
+        client(['container', 'stop', '--time=10', created], verifier)
+        stopped = json.loads(client(['container', 'inspect', created], verifier))[0]
+        require(stopped['Id'] == created and stopped['State'].get('Running') is False,
+                'Owned smoke container did not stop before host lock handoff')
+        with Path(LOCK).open('rb') as host_lock:
+            require(os.fstat(host_lock.fileno()).st_dev == lock_stat.st_dev
+                    and os.fstat(host_lock.fileno()).st_ino == lock_stat.st_ino,
+                    'Host smoke lock inode differs')
+            fcntl.flock(host_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            exported = directory / 'outputs.tar'
+            client(['container', 'cp', created + ':/builder/smoke-out/.', '-'], verifier,
+                   destination=exported, cap=1024**3 + MIB, timeout=120)
+            unpack_outputs(exported, directory / 'artifacts')
+            return inspect_artifacts(layout, directory, context, output, selection)
     finally:
         # Delete only this newly created ID; never reap other native/ASU containers.
         client(['container', 'rm', '--force', created], verifier)
