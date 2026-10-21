@@ -70,6 +70,11 @@ engine. `ASU_BUILD_UID`, `ASU_BUILD_GID`, `ASU_BUILD_LOCK_GID`, `ASU_ROOTLESS_SO
 inherit the supplementary lock group explicitly. Dedicated build-user/service setup and origin TLS are separate operator
 steps. A rootless engine socket confers that user's permissions; use a dedicated
 user without production Docker group membership.
+
+APIs and the worker join both the internal `api` network and the dedicated
+noninternal `egress` bridge. The latter permits HTTPS index access and Docker
+host-port publishing. Redis stays only on `api`; the frontend keeps its existing
+`api` and NPM networks. API host ports remain bound to loopback.
 The applied setup scripts, current host identity, mapped container-UID read ACL,
 and actual PID1 hard-kill lock proof are documented in [ops/host](../ops/host/README.md).
 

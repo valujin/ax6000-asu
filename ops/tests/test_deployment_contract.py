@@ -35,6 +35,13 @@ class RootlessSocketDeploymentTests(unittest.TestCase):
         self.assertEqual(worker['environment']['ASU_BUILD_ENGINE_URL'], 'unix:///run/ax6000-build/docker.sock')
         self.assertEqual(worker['user'], '2000:2000')
         self.assertEqual(list(map(str, worker['group_add'])), ['987'])
+        self.assertTrue(model['networks']['api']['internal'])
+        self.assertEqual(model['networks']['egress']['driver'], 'bridge')
+        self.assertFalse(model['networks']['egress'].get('internal', False))
+        for name in ('api66', 'api612recommended', 'api612latest', 'worker'):
+            self.assertEqual(set(model['services'][name]['networks']), {'api', 'egress'})
+        self.assertEqual(set(model['services']['redis']['networks']), {'api'})
+        self.assertEqual(model['services']['api66']['ports'][0]['host_ip'], '127.0.0.1')
         for service in model['services'].values():
             for volume in service.get('volumes', []):
                 self.assertNotEqual(volume.get('source'), '/var/run/docker.sock')

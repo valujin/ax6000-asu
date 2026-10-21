@@ -15,7 +15,9 @@ x-api: &api
   volumes:
     - ${ASU_STATE_DIR:?Set dedicated state directory}/catalogs:/catalogs:ro
     - ${ASU_STATE_DIR}/public:/public:ro
-  networks: [api]
+  # Docker 29 does not publish host ports for an internal-only bridge member.
+  # This separate bridge also supplies HTTPS egress for immutable indexes.
+  networks: [api, egress]
   depends_on: [redis]
   logging: {driver: local, options: {max-size: 2m, max-file: "2"}}
 
@@ -74,7 +76,7 @@ services:
       - ${ASU_ROOTLESS_SOCKET:?Use dedicated rootless socket}:/run/ax6000-build/docker.sock:ro
       - /home/valuxin/dev/owrt/ax6000-packages-build/work/.build.lock:/build-lock/.build.lock:ro
     tmpfs: ["/tmp:size=64m,mode=1777"]
-    networks: [api]
+    networks: [api, egress]
     depends_on: [redis]
     logging: {driver: local, options: {max-size: 2m, max-file: "2"}}
   redis:
@@ -95,3 +97,6 @@ services:
 networks:
   api:
     internal: true
+  egress:
+    driver: bridge
+    internal: false
