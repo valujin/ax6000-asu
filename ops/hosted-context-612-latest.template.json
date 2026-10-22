@@ -1,35 +1,36 @@
 {
-  "schema_version": 1,
-  "kind": "ax6000-asu-hosted-context-v1",
-  "producer_commit": "2a96db1b7163f37222a464b0795b8502e23b9e88",
-  "producer_seed": "19f59b194c1ea42734153adbf588af3de97081cfcc6aeb829447a17b60997228",
-  "identity": null,
-  "receipts": {
-    "completion": null,
-    "api": null,
-    "download": null,
-    "kernel_witness": null,
-    "overlay": null,
-    "persisted_ib": null,
-    "native_acceptance": null,
-    "native_evidence": null,
-    "independent_verification": null
-  },
-  "native_inputs": {
-    "profile.json": null,
-    "lock.json": null,
-    "firmware-manifest.json": null,
-    "build.config": null
-  },
-  "sdk_archive": null,
   "functional_kernel": null,
-  "tools": {
-    "fwtool": null,
-    "unsquashfs4": null,
-    "jsmin": null
+  "identity": null,
+  "kind": "ax6000-asu-hosted-context-v1",
+  "native_inputs": {
+    "build.config": null,
+    "firmware-manifest.json": null,
+    "lock.json": null,
+    "profile.json": null
   },
   "pbr_archives": {
-    "pbr": null,
-    "luci-app-pbr": null
+    "luci-app-pbr": null,
+    "pbr": null
+  },
+  "producer_commit": "deeea41a13b8e3ffff64fce6deec6f37d5085b12",
+  "producer_seed": "7578632e519ac983062468679ea9f7f52c8a4466ef2685dafafe56961801c4a5",
+  "receipts": {
+    "api": null,
+    "completion": null,
+    "download": null,
+    "independent_verification": null,
+    "kernel_witness": null,
+    "native_acceptance": null,
+    "native_evidence": null,
+    "overlay": null,
+    "persisted_ib": null,
+    "root_decision": null
+  },
+  "schema_version": 1,
+  "sdk_archive": null,
+  "tools": {
+    "fwtool": null,
+    "jsmin": null,
+    "unsquashfs4": null
   }
 }

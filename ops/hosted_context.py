@@ -14,10 +14,10 @@ import re
 import subprocess
 import zipfile
 
-PRODUCER = '2a96db1b7163f37222a464b0795b8502e23b9e88'
+PRODUCER = 'deeea41a13b8e3ffff64fce6deec6f37d5085b12'
 SOURCE = 'a99b0888b88f134f56bcb2a7d93027b5d20638a9'
-RUN = 39646536507
-SEED = '19f59b194c1ea42734153adbf588af3de97081cfcc6aeb829447a17b60997228'
+RUN = 39691822857
+SEED = '7578632e519ac983062468679ea9f7f52c8a4466ef2685dafafe56961801c4a5'
 OLD_CONTEXT = '24980eeed1f05bea99abd80cf0b544d2a49742de1837a100394d66c3ad0893a8'
 SHA = re.compile('[0-9a-f]{64}')
 LAYOUTS = {'stock', 'mtkuboot', 'ubootmod'}
@@ -380,7 +380,7 @@ def load(path, digest, *, cohort, profile, native, raw, recipe):
     for name in ('asu', 'package_only', 'image_packages', 'pbr_source', 'vendor_country_db', 'apk_key_sha256'):
         need(profile.get(name) == original.get(name), 'Hosted generated native policy differs from producer profile: ' + name)
     needed = {'completion', 'api', 'download', 'kernel_witness', 'overlay', 'persisted_ib',
-              'native_acceptance', 'native_evidence', 'independent_verification'}
+              'native_acceptance', 'native_evidence', 'independent_verification', 'root_decision'}
     need(set(proof.get('receipts', {})) == needed, 'Hosted receipt roles are incomplete')
     data = {name: json_file(checked_record(record)) for name, record in proof['receipts'].items()}
     native_sha = proof['receipts']['native_evidence']['sha256']
@@ -417,10 +417,13 @@ def load(path, digest, *, cohort, profile, native, raw, recipe):
     checks = persisted['independently_revalidated']
     need(checks.get('full_native_source') is False and all(checks.get(name) is True for name in
          ('persisted_native_apk_bank_vs_actual_raw', 'signed_index_and_keys', 'all_persisted_context_hashes',
-          'reviewed_abi_helpers', 'tracked_source_makefile_transformation', 'tracked_source_bundler_digest',
-          'raw_native_apk_source_elf_digest', 'apk_world_hook_helper_policy', 'sdk_prepared_kernel_config',
+          'reviewed_abi_helpers', 'apk_world_hook_helper_policy', 'sdk_prepared_kernel_config',
           'three_functional_kernels')) and set(checks.get('three_layout_dtbs', {})) == LAYOUTS
          and all(checks['three_layout_dtbs'].values()), 'Hosted persisted independent verification is incomplete')
+    producer_checks = persisted.get('producer_side_revalidated', {})
+    need(all(producer_checks.get(name) is True for name in ('tracked_source_makefile_transformation',
+          'tracked_source_bundler_digest', 'raw_native_apk_source_elf_digest')),
+         'Original successful source witness must cover source transformations')
     checked_record(persisted['archive'], 2 * 1024**3)
     checked_record(persisted['attestation'])
     need(persisted['archive']['sha256'] == persisted['archive_sha256']
@@ -441,27 +444,52 @@ def load(path, digest, *, cohort, profile, native, raw, recipe):
     need(accepted['hosted_kernel_witness'] == {key: proof['receipts']['kernel_witness'][key] for key in ('size', 'sha256')}
          and checked_record(accepted['independent_verification']) == checked_record(proof['receipts']['independent_verification']),
          'Hosted independent acceptance chain differs')
-    need(independent.get('kind') == 'latest-apk-artifact-native-independent-verification'
-         and independent.get('ok') is True and independent.get('run_id') == RUN
-         and independent.get('recipe_commit') == PRODUCER and independent.get('source_commit') == SOURCE
-         and independent.get('build_id') == profile['build_id'] and independent.get('raw_tools_executed') is False
-         and independent.get('native_cloud_evidence_sha256') == native_sha
-         and independent.get('download_receipt_sha256') == proof['receipts']['download']['sha256'],
-         'Hosted independent artifact verification differs')
-    need(independent.get('asu_seed') == accepted.get('seed') == profile['asu']['seed']
+    need(independent.get('kind') == 'successful-latest-artifact-independent-inspection-v1'
+         and independent.get('ok') is True and independent.get('artifact_checks_passed') is True
+         and independent.get('run_id') == RUN and independent.get('producer_commit') == PRODUCER
+         and independent.get('source_commit') == SOURCE and independent.get('build_id') == profile['build_id']
+         and independent.get('raw_or_vendor_executable_executed') is False
+         and independent.get('local_native_source_claimed') is False
+         and independent.get('independent_full_native_source_revalidation') is False
+         and independent.get('original_native_source_witness_preserved') is True
+         and independent.get('original_verifier_success') is True
+         and independent.get('cloud_native_evidence') == proof['receipts']['native_evidence'],
+         'Actual successful independent artifact/source witness differs')
+    need(independent.get('seed') == accepted.get('seed') == profile['asu']['seed']
          and independent.get('kernel_abi') == accepted.get('kernel_abi') == witness.get('kernel_abi')
-         == profile['firmware']['kernel_version']
-         and independent.get('sdk_sha256') == proof['sdk_archive']['sha256']
+         == profile['firmware']['kernel_version'] and independent.get('sdk') == proof['sdk_archive']
          and accepted.get('channel') == 'latest' and accepted.get('package_manager') == 'apk'
-         and independent.get('package_manager') == 'apk' and set(independent.get('layouts', {})) == LAYOUTS,
-         'Hosted accepted kernel/seed/SDK/layout scope differs')
-    for name, field in [('profile.json', 'raw_profile_sha256'), ('lock.json', 'raw_lock_sha256'),
-                        ('firmware-manifest.json', 'raw_manifest_sha256')]:
-        need(independent.get(field) == proof['native_inputs'][name]['sha256'],
-             'Hosted independent RAW metadata link differs')
-    for role, field in [('persisted_ib', 'imagebuilder_persisted_verification'), ('overlay', 'rootfs_overlay_evidence')]:
-        need(independent[field]['sha256'] == proof['receipts'][role]['sha256']
-             and independent[field]['path'] == proof['receipts'][role]['path'], 'Hosted artifact proof link differs')
+         and set(independent.get('layouts', {})) == LAYOUTS
+         and independent.get('native_inputs') == proof['native_inputs'],
+         'Actual successful accepted kernel/seed/SDK/layout/metadata differs')
+    need(independent.get('imagebuilder') == persisted.get('archive')
+         and independent.get('imagebuilder_attestation') == persisted.get('attestation'),
+         'Actual persisted IB archive/attestation is not the independently checked one')
+    approval = module(Path(__file__).with_name('hosted_acceptance.py'), 'successful_hosted_existing_context')
+    need(proof['receipts']['root_decision']['sha256'] == approval.DECISION_SHA
+         and proof['receipts']['independent_verification']['sha256'] == approval.INSPECTION_SHA
+         and independent['capture']['sha256'] == approval.CAPTURE_SHA
+         and data['download'].get('original_capture') == independent['capture']
+         and accepted.get('root_decision') == witness.get('root_decision') == proof['receipts']['root_decision']
+         and accepted.get('kind') == 'ax6000-hosted-existing-context-native-acceptance-v1'
+         and accepted.get('strict_base_context_unchanged') is True
+         and accepted.get('prior_opkg_kernel_migration_verified') is True
+         and accepted.get('new_kernel_context_enrolled') is False,
+         'Exact successful existing-context root decision chain required')
+    strict = json_file(checked_record(independent['strict_baseline']))
+    relation = json_file(checked_record(independent['prior_identity_relation']))
+    difference = json_file(checked_record(independent['functional_image_diagnostic']))
+    decision_proofs = {'capture': independent['capture'],
+        'independent_inspection': proof['receipts']['independent_verification'],
+        'original_native_evidence': proof['receipts']['native_evidence'],
+        'strict_baseline': independent['strict_baseline'],
+        'prior_identity_relation': independent['prior_identity_relation'],
+        'functional_image_diagnostic': independent['functional_image_diagnostic'],
+        'prior_opkg_context': witness['prior_opkg_context']}
+    approval.verify(data['root_decision'], decision_proofs,
+        {'run_id': RUN, 'producer_commit': PRODUCER, 'source_commit': SOURCE, 'seed': SEED,
+         'build_id': profile['build_id'], 'kernel_abi': profile['firmware']['kernel_version'],
+         'input_sdk_sha256': profile['sdk']['sha256']}, strict, relation, difference)
     need(checked_record(persisted['producer_side_source_validation']['completion'])
          == checked_record(proof['receipts']['completion']), 'Producer source completion binding differs')
     need(checked_record(data['completion']['api_records']) == checked_record(proof['receipts']['api'])

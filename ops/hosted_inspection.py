@@ -56,7 +56,7 @@ def expected_features(hosted, verifier, profile, lock):
         files['www/luci-static/resources/ax6000_asu.js'] = ((hosted.recipe / 'files/asu-client/ax6000_asu.js').read_bytes(), 0o644)
         files['usr/share/rpcd/acl.d/luci-app-attendedsysupgrade.json'] = (client._acl(original['acl.json']), 0o644)
         files['etc/uci-defaults/50-attendedsysupgrade'] = (original['common.defaults'].replace(b'https://sysupgrade.kyarucloud.moe', policy['server_url'].encode()), 0o644)
-        versions['attendedsysupgrade-common'] = '10-r' + client.release(profile)
+        versions['attendedsysupgrade-common'] = '10-r' + client.common_release(profile)
         versions['luci-app-attendedsysupgrade'] = client.APP_VERSION + '-r' + client.release(profile)
         suffixes['luci-i18n-attendedsysupgrade-ru'] = ''
     if profile.get('vendor_country_db'):

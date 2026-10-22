@@ -17,9 +17,9 @@ SPEC.loader.exec_module(hosted)
 
 class HostedContracts(unittest.TestCase):
     def test_only_new_reviewed_producer_run_and_seed_are_selected(self):
-        self.assertEqual(hosted.PRODUCER, '2a96db1b7163f37222a464b0795b8502e23b9e88')
-        self.assertEqual(hosted.RUN, 39646536507)
-        self.assertEqual(hosted.SEED, '19f59b194c1ea42734153adbf588af3de97081cfcc6aeb829447a17b60997228')
+        self.assertEqual(hosted.PRODUCER, 'deeea41a13b8e3ffff64fce6deec6f37d5085b12')
+        self.assertEqual(hosted.RUN, 39691822857)
+        self.assertEqual(hosted.SEED, '7578632e519ac983062468679ea9f7f52c8a4466ef2685dafafe56961801c4a5')
         profile = {'channel': 'latest', 'package_manager': 'apk',
                    'firmware': {'commit': hosted.SOURCE},
                    'asu': {'cohort': '612-latest', 'seed': hosted.SEED}}

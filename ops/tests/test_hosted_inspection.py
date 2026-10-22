@@ -101,5 +101,29 @@ def inspect_root(*args, feature_lock=None, feature_source=None, apk=None):
         with self.assertRaises(ValueError):
             inspection.verify_features(self.hosted, verifier, {}, {}, {}, None, None, source=Path('/fake-source'))
 
+    def test_APP3_uses_its_distinct_common_package_release(self):
+        script = self.recipe / 'files/asu-client/ax6000_asu.js'
+        script.parent.mkdir(parents=True); script.write_bytes(b'SYNTHETIC app3 bytes')
+        originals = {'overview.js': b'view', 'status.js': b'status', 'acl.json': b'acl',
+                     'common.defaults': b'https://sysupgrade.kyarucloud.moe'}
+        fixture = Path(__file__).parent / 'fixtures/deeea_asu_client.py'
+        self.assertEqual(hashlib.sha256(fixture.read_bytes()).hexdigest(),
+                         'f378ef66f9a0c6abb17d82b1b5247269f06688414855d20653a81ce399d05ede')
+        spec = importlib.util.spec_from_file_location('actual_deeea_asu_client', fixture)
+        actual = importlib.util.module_from_spec(spec); spec.loader.exec_module(actual)
+        profile = {'package_manager': 'apk', 'asu': {'enabled': True, 'cohort': '612-latest',
+            'server_url': 'https://asu.ezon.by/612/latest', 'seed': '7'*64}}
+        self.assertEqual(actual.release(profile), '3')
+        self.assertEqual(actual.common_release(profile), '2')
+        client = SimpleNamespace(policy=actual.policy,
+            _originals=lambda cohort: originals, patch_overview=lambda b: b, patch_status=lambda b: b,
+            _acl=lambda b: b, release=actual.release, common_release=actual.common_release,
+            APP_VERSION=actual.APP_VERSION)
+        features = SimpleNamespace(asu_client=client, pbr_sources=SimpleNamespace(validate=lambda p,l: None), vendor_country=object())
+        host = SimpleNamespace(recipe=self.recipe, expected_overlay=lambda: {})
+        result = inspection.expected_features(host, SimpleNamespace(image_features=features), profile, {})
+        self.assertEqual(result['versions']['attendedsysupgrade-common'], '10-r2')
+        self.assertEqual(result['versions']['luci-app-attendedsysupgrade'], '20261021.2-r3')
+
 
 if __name__ == '__main__': unittest.main()
