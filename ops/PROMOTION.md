@@ -17,6 +17,18 @@ Run it only after independent verification of the actual native firmware, real I
 
 Native core recipe roots, manager, vendor/ASU packages, their installed dependency closure and every native kmod remain protected. Supplemental packages may update approved user applications. Native installed manifests are checked against the original native bank before merging daily updates; default package names then use the approved merged versions, so a newer PBR release does not invalidate its original native manifest. Protected native archives must retain their exact native bytes. Canonical identities preserve actual package names and only their declared ABI suffixes in both APK and OPKG, including native suffixes such as `-0`. Packages without a declared suffix use an empty suffix. Tailscale remains outside mandatory/default images.
 
+The optional `--native-acceptance PATH --native-acceptance-sha256 SHA` pair
+supports the existing EA schema2 enrollment and the independently reviewed b122
+recommended schema3 status (`e7bfbf6ad2698eb05718b0c379c81468b681a5f84b07161d9da252dcc979dbf6`).
+The latter verifies actual RAW metadata, native evidence for all three layouts,
+world/packaging custody and the SDK baseline. It compares the current whole new
+Image, four ABI files and seven SDK contexts, plus the preserved original source
+context; the outer source `.config` must equal RAW `build.config`. It records
+`strict_new_context_unchanged: true`, `prior_image_equal: false` and
+`prior_abi_context_equal: true`. A candidate or failed producer record cannot
+replace successful independent native acceptance. Other cohorts retain their
+existing behavior, and all signed snapshot, overlay and smoke gates still run.
+
 For an APK snapshot whose frozen native recipe predates the reviewed
 `openwrt-keyring` compatibility provider fix, explicitly supply
 `--operator-publisher-dir /trusted/reviewed-publisher`. This directory must contain

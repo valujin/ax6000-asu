@@ -1,13 +1,17 @@
-"""Optional operator-only acceptance of one exact enrolled REC Image transition.
+"""Optional operator-only acceptance of two exact reviewed REC generations.
 
-This does not grant acceptance from an enrollment/proposal alone. A separately
-reviewed successful native V2 envelope must bind actual evidence and RAW bytes.
-The complete enrolled Image and four ABI files are always compared byte-exactly.
+The original enrolled schema2 route is retained. The b122 schema3 route requires
+its independently reviewed successful status, actual evidence and RAW custody.
+Candidates alone grant no acceptance; current whole Image/ABI contexts are exact.
 """
 import hashlib
+import importlib.util
 import json
 from pathlib import Path, PurePosixPath
 import re
+
+NEW_CONTEXT_PRODUCER = 'b122c35046ab1c3cd03828aabd168bb35466e2c8'
+NEW_CONTEXT_STATUS_SHA = 'e7bfbf6ad2698eb05718b0c379c81468b681a5f84b07161d9da252dcc979dbf6'
 
 PRODUCER = 'ea6de11283a6d83728e50b4b9ced214761ecc1c0'
 SOURCE = 'ae65e1de69971b5a2e3cf7e39390ee93f274d488'
@@ -75,8 +79,90 @@ def read(path, *, object_only=True):
     return data
 
 
+def new_context_module():
+    spec = importlib.util.spec_from_file_location('operator_native_new_context',
+                                                 Path(__file__).with_name('native_new_context.py'))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def verify_new_context(path, pin, *, cohort, profile, native, native_evidence,
+                       native_evidence_sha256, raw, source, recipe_commit):
+    context = new_context_module()
+    need(cohort == '612-recommended' and recipe_commit == NEW_CONTEXT_PRODUCER
+         and profile.get('channel') == 'recommended' and profile.get('package_manager') == 'apk'
+         and profile.get('asu', {}).get('cohort') == cohort
+         and profile['asu'].get('seed') == context.SEED
+         and profile.get('firmware', {}).get('commit') == context.SOURCE
+         and profile['firmware'].get('kernel_version') == context.ABI,
+         'Schema3 acceptance is restricted to the exact b122 recommended APK producer')
+    need(pin == NEW_CONTEXT_STATUS_SHA and record(path)['sha256'] == pin,
+         'Exact independently reviewed schema3 native status SHA256 required')
+    # Keep the normal strict JSON decoder, including duplicate-key refusal.
+    envelope = read(path)
+    status, candidate, _ = context.load_accepted(Path(path), pin)
+    need(envelope == status and status.get('build_id') == profile['build_id'],
+         'Schema3 native generation differs')
+    raw, source = Path(raw).absolute(), Path(source).absolute()
+    need(status['raw'] == str(raw) and status['source'] == str(source),
+         'Schema3 actual source/RAW custody differs')
+    evidence_path = file_ref(status['native_evidence'], native_evidence_sha256)
+    need(evidence_path == Path(native_evidence).absolute() and read(evidence_path) == native
+         and status['evidence_sha256'] == native_evidence_sha256
+         and native.get('schema_version') == 1 and native.get('ok') is True
+         and native.get('source_commit') == context.SOURCE and native.get('kernel_abi') == context.ABI
+         and native.get('build_id') == profile['build_id'] and native.get('package_manager') == 'apk'
+         and native.get('channel') == 'recommended' and set(native.get('layouts', {})) == LAYOUTS,
+         'Schema3 underlying full native evidence differs')
+    for kernel in [native.get('sysupgrade_input', {}), *(row.get('kernel', {}) for row in native['layouts'].values())]:
+        need(all(kernel.get(k) == v for k, v in status['accepted_kernel_image'].items()),
+             'Schema3 layout does not contain the exact complete new Image')
+    need(status.get('sdk') == profile.get('sdk')
+         and native.get('sdk_context', {}).get('sdk_sha256') == profile['sdk']['sha256']
+         and native['sdk_context'].get('matching_contexts') == status['source_context7'],
+         'Schema3 SDK archive or all-seven prepared contexts differ')
+    # Approved helper retains all honest world/packaging failure custody and
+    # compares whole owned/new and original/prior Image bytes plus ABI4/SDK7.
+    for root, item in [(source, candidate['owned_context']),
+                       (Path(status['original_source']), candidate['original_context'])]:
+        for row in item['required_files'].values():
+            relative = PurePosixPath(row['path'])
+            need(not relative.is_absolute() and '..' not in relative.parts and str(relative) == row['path'],
+                 'Unsafe schema3 source role path')
+            regular(root / relative)
+        for role in context.SEVEN:
+            regular(root / context.KROOT / role)
+    need(record(source / '.config') == record(raw / 'build.config'),
+         'Schema3 outer source configuration differs from actual RAW build.config')
+    context.source_contexts(status, candidate)
+    need(read(raw / 'profile.json') == profile and set(status['native_inputs']) ==
+         {'profile.json', 'lock.json', 'firmware-manifest.json'}
+         and all(record(raw / name) == row for name, row in status['native_inputs'].items()),
+         'Schema3 actual RAW input bytes differ')
+    manifest = read(raw / 'firmware-manifest.json')
+    need(manifest.get('recipe_commit') == NEW_CONTEXT_PRODUCER and manifest.get('source_commit') == context.SOURCE
+         and manifest.get('build_id') == profile['build_id'] and manifest.get('kernel_version') == context.ABI,
+         'Schema3 RAW producer/generation differs')
+    baseline = read(file_ref(status['sdk_baseline']))
+    need(baseline.get('schema_version') == 1 and baseline.get('package_manager') == 'apk'
+         and baseline.get('source_commit') == context.SOURCE and baseline.get('kernel_version') == context.ABI,
+         'Schema3 native SDK baseline identity differs')
+    return {'native_acceptance_sha256': pin, 'native_acceptance_schema_version': 3,
+            'strict_accepted_context_unchanged': False, 'strict_new_context_unchanged': True,
+            'prior_image_equal': False, 'prior_abi_context_equal': True,
+            'accepted_kernel_image': status['accepted_kernel_image'], 'prior_kernel_image': status['prior_kernel_image'],
+            **{name + '_sha256': status[name]['sha256'] for name in
+               ('candidate_context', 'world_success_custody', 'producer_completion')},
+            'native_bank_sha256': status['native_bank_sha256']}
+
+
 def verify(path, pin, *, cohort, profile, native, native_evidence, native_evidence_sha256,
            raw, source, recipe_commit):
+    if recipe_commit == NEW_CONTEXT_PRODUCER:
+        return verify_new_context(path, pin, cohort=cohort, profile=profile, native=native,
+                                  native_evidence=native_evidence, native_evidence_sha256=native_evidence_sha256,
+                                  raw=raw, source=source, recipe_commit=recipe_commit)
     need(cohort == '612-recommended' and recipe_commit == PRODUCER
          and profile.get('channel') == 'recommended' and profile.get('package_manager') == 'apk'
          and profile.get('asu', {}).get('cohort') == cohort
