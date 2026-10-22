@@ -62,11 +62,30 @@ RECOMMENDED_VENDOR_WRAPPER = {
     'sha256': '5b57f0df74b479682186a0e6f9ea7215d0ccab060377a351296684762ccf93e9',
     'size': 236,
 }
+LATEST_PUBLIC_VENDOR_TOOL = {
+    'path': 'staging_dir/host/bin/.dlink-sge-image.bin',
+    'sha256': '420d137a6e4940c842ae1f695faacdafb7ae3d30689865e9bc9e758b98992301',
+    'size': 1491024,
+    'classification': 'public-upstream-vendor-factory-keys',
+    'source_repository': 'https://git.openwrt.org/project/firmware-utils.git',
+    'source_commit': '6a87eaf434cb89d4eba0b811a4b5d158fd9c519f',
+    'source_header_path': 'src/dlink-sge-image.h',
+    'source_header_sha256': '1455ab4366e869ea7afe3fecbe8b20baa5c9a2c105dc18c6e3dc9bfc55483e87',
+    'source_implementation_path': 'src/dlink-sge-image.c',
+    'source_implementation_sha256': 'b9ee120c68b3d1ea2f479ee15f646a0aa3343aa36a92db7a4d647cf91bad43b3',
+    'public_key_blocks': 6,
+}
+LATEST_VENDOR_WRAPPER = {
+    'path': 'staging_dir/host/bin/dlink-sge-image',
+    'sha256': '5b57f0df74b479682186a0e6f9ea7215d0ccab060377a351296684762ccf93e9',
+    'size': 236,
+}
 # Literal records only: each additional portable payload requires independent
 # exact-byte/source review before a code change. A source ELF or an older SDK is
-# not approval of a new ImageBuilder payload. No LATEST payload is approved.
+# not approval of a new ImageBuilder payload. Each literal is measured separately.
 REVIEWED_PUBLIC_VENDOR_TOOLS = (('66', PUBLIC_VENDOR_TOOL),
-                                ('612-recommended', RECOMMENDED_PUBLIC_VENDOR_TOOL))
+                                ('612-recommended', RECOMMENDED_PUBLIC_VENDOR_TOOL),
+                                ('612-latest', LATEST_PUBLIC_VENDOR_TOOL))
 
 
 def require(value, message):
@@ -134,11 +153,11 @@ def verify_reviewed_vendor_tool(path, approved):
         header = stream.read(20)
     require(header[:7] == b'\x7fELF\x02\x01\x01' and header[18:20] == b'\x3e\x00',
             'Reviewed public vendor tool is not the expected x86-64 ELF')
-    if approved == RECOMMENDED_PUBLIC_VENDOR_TOOL:
-        wrapper = RECOMMENDED_VENDOR_WRAPPER
+    if approved in (RECOMMENDED_PUBLIC_VENDOR_TOOL, LATEST_PUBLIC_VENDOR_TOOL):
+        wrapper = RECOMMENDED_VENDOR_WRAPPER if approved == RECOMMENDED_PUBLIC_VENDOR_TOOL else LATEST_VENDOR_WRAPPER
         visible = regular(path.with_name(PurePosixPath(wrapper['path']).name), wrapper['size'])
         require(visible.stat().st_size == wrapper['size'] and sha256(visible) == wrapper['sha256'],
-                'Reviewed REC vendor-tool wrapper bytes differ')
+                'Reviewed vendor-tool wrapper bytes differ')
 
 
 def validate_inputs(archive, archive_sha, proof_path, proof_sha, profile_path, public_key_path):

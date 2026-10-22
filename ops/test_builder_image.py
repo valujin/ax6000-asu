@@ -220,7 +220,7 @@ class BuilderImageTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     image.verify_reviewed_vendor_tool(path, entry)
 
-    def test_recommended_portable_record_is_literal_and_latest_remains_unapproved(self):
+    def test_recommended_portable_record_is_literal_and_other_cohorts_are_rejected(self):
         entry = copy.deepcopy(image.RECOMMENDED_PUBLIC_VENDOR_TOOL)
         proof = {'cohort': '612-recommended', 'reviewed_public_vendor_tools': [entry]}
         self.assertEqual(image.reviewed_vendor_tools(proof), {entry['path']: entry})
@@ -281,6 +281,47 @@ class BuilderImageTests(unittest.TestCase):
         visible.symlink_to(wrapper_fixture)
         with self.assertRaises(ValueError):
             image.verify_reviewed_vendor_tool(path, entry)
+
+    def test_latest_measured_literal_is_cohort_bound_and_historical_sdk_is_unapproved(self):
+        entry = copy.deepcopy(image.LATEST_PUBLIC_VENDOR_TOOL)
+        self.assertEqual((entry['sha256'], entry['size'], entry['public_key_blocks']),
+                         ('420d137a6e4940c842ae1f695faacdafb7ae3d30689865e9bc9e758b98992301', 1491024, 6))
+        proof = {'cohort': '612-latest', 'reviewed_public_vendor_tools': [entry]}
+        self.assertEqual(image.reviewed_vendor_tools(proof), {entry['path']: entry})
+        for cohort in ('66', '612-recommended', None):
+            with self.subTest(cohort=cohort), self.assertRaises(ValueError):
+                image.reviewed_vendor_tools(proof | {'cohort': cohort})
+        for field, value in [('sha256', '0' * 64), ('size', entry['size'] + 1),
+                             ('source_commit', '0' * 40), ('source_header_sha256', '0' * 64),
+                             ('public_key_blocks', 5), ('allow_all_keys', True)]:
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                image.reviewed_vendor_tools(proof | {'reviewed_public_vendor_tools': [entry | {field: value}]})
+
+    def test_actual_latest_measured_elf_requires_exact_visible_wrapper(self):
+        directory = Path('/home/valuxin/dev/owrt/asu-pbr-db-2026-10-21/vendor612-latest-payload-measurement-preparation-v2/actual-latest-v2/result')
+        entry = image.LATEST_PUBLIC_VENDOR_TOOL
+        fixture = directory / 'portable-vendor-elf.bin'
+        wrapper_fixture = directory / 'portable-wrapper.txt'
+        if not fixture.is_file() or not wrapper_fixture.is_file():
+            self.skipTest('Independently measured LATEST public tool fixtures unavailable')
+        path = self.root / entry['path']
+        path.parent.mkdir(parents=True)
+        blob, wrapper = fixture.read_bytes(), wrapper_fixture.read_bytes()
+        path.write_bytes(blob)
+        visible = path.with_name('dlink-sge-image')
+        visible.write_bytes(wrapper)
+        image.verify_reviewed_vendor_tool(path, entry)
+        for wrong in (blob[:-1], blob + b'!', blob[:-1] + bytes([blob[-1] ^ 1])):
+            path.write_bytes(wrong)
+            with self.assertRaises(ValueError): image.verify_reviewed_vendor_tool(path, entry)
+        path.write_bytes(blob)
+        for wrong in (wrapper[:-1], wrapper + b'!', b'-----BEGIN OPENSSH PRIVATE KEY-----'):
+            visible.write_bytes(wrong)
+            with self.assertRaises(ValueError): image.verify_reviewed_vendor_tool(path, entry)
+        visible.unlink()
+        with self.assertRaises(ValueError): image.verify_reviewed_vendor_tool(path, entry)
+        visible.symlink_to(wrapper_fixture)
+        with self.assertRaises(ValueError): image.verify_reviewed_vendor_tool(path, entry)
 
     def test_vendor_exception_requires_reapproved_receipt_digest(self):
         self.proof['reviewed_public_vendor_tools'] = [copy.deepcopy(image.PUBLIC_VENDOR_TOOL)]
